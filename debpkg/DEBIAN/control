@@ -1,0 +1,7 @@
+Package: wp5
+Version: 1.00
+Section: base
+Architecture: arm64
+Maintainer: support@uugear.com
+Installed-Size: 110
+Description: Software for managing Witty Pi 5.

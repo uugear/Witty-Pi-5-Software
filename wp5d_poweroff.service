@@ -1,0 +1,12 @@
+[Unit]
+Description=Inform Witty Pi 5 about the poweroff
+DefaultDependencies=no
+Before=umount.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/wp5d --poweroff
+
+[Install]
+WantedBy=poweroff.target
+

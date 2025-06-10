@@ -1,0 +1,5 @@
+/usr/bin/wp5d
+/usr/bin/wp5
+/lib/systemd/system/wp5d.service
+/lib/systemd/system/wp5d_poweroff.service
+/lib/systemd/system/wp5d_reboot.service

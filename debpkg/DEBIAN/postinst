@@ -1,0 +1,15 @@
+#!/bin/sh
+set -e
+chmod 544 /usr/bin/wp5d
+chmod 544 /usr/bin/wp5
+
+systemctl daemon-reload
+systemctl enable wp5d.service
+systemctl enable wp5d_poweroff.service
+systemctl enable wp5d_reboot.service
+
+echo 'Starting Witty Pi 5 daemon...'
+systemctl stop wp5d.service
+systemctl start wp5d.service
+echo 'Done'
+exit 0

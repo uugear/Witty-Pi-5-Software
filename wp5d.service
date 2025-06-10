@@ -1,0 +1,14 @@
+[Unit]
+Description=Witty Pi 5 daemon service
+After=remote-fs.target
+
+[Service]
+Type=simple
+WorkingDirectory=/usr/bin/
+ExecStart=/usr/bin/wp5d
+Restart=on-failure
+StandardOutput=append:/var/log/wp5d.log
+StandardError=append:/var/log/wp5d.log
+
+[Install]
+WantedBy=multi-user.target
