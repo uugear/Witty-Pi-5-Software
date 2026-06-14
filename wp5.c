@@ -21,8 +21,12 @@
 #define LOCAL_FILE_LIST_MAX             128
 #define REMOTE_FILE_LIST_MAX            128
 #define MAX_CHUNK_CONTENT               4000
-#define FW_FILE_ADMIN_REQUIRED_MAJOR    1
-#define FW_FILE_ADMIN_REQUIRED_MINOR    2
+
+#define FW_FILE_ADMIN_REQUIRED_MAJOR        1
+#define FW_FILE_ADMIN_REQUIRED_MINOR        2
+#define FW_VIN_HOT_STANDBY_REQUIRED_MAJOR   1
+#define FW_VIN_HOT_STANDBY_REQUIRED_MINOR   5
+
 #define SCRIPT_ACTIVATION_SETTLE_MS     25000
 #define SCRIPT_ACTIVATION_POLL_MS       250
 #define DEVICE_READY_WAIT_MS            2000
@@ -329,16 +333,28 @@ static bool wait_for_schedule_activation_result(bool before_in_use,
 }
 
 
-static bool firmware_supports_file_management(void) {
+static bool firmware_version_at_least(int required_major, int required_minor) {
     int major = 0;
     int minor = 0;
     if (!get_firmware_version(&major, &minor)) {
         return false;
     }
-    if (major > FW_FILE_ADMIN_REQUIRED_MAJOR) {
+    if (major > required_major) {
         return true;
     }
-    return (major == FW_FILE_ADMIN_REQUIRED_MAJOR && minor >= FW_FILE_ADMIN_REQUIRED_MINOR);
+    return major == required_major && minor >= required_minor;
+}
+
+
+static bool firmware_supports_file_management(void) {
+    return firmware_version_at_least(FW_FILE_ADMIN_REQUIRED_MAJOR,
+                                     FW_FILE_ADMIN_REQUIRED_MINOR);
+}
+
+
+static bool firmware_supports_vin_hot_standby(void) {
+    return firmware_version_at_least(FW_VIN_HOT_STANDBY_REQUIRED_MAJOR,
+                                     FW_VIN_HOT_STANDBY_REQUIRED_MINOR);
 }
 
 
@@ -1743,13 +1759,27 @@ void other_settings(void) {
 	// [12] Log to file
     uint8_t ltf = i2c_get(i2c_dev, I2C_CONF_LOG_TO_FILE);
 	printf("  [12] Log to file on Witty Pi [%s]\n", ltf ? "Yes" : "No");
+
+    // [13] VIN hot standby
+    bool vin_hot_standby_supported = firmware_supports_vin_hot_standby();
+    if (vin_hot_standby_supported) {
+        int vhs = i2c_get(i2c_dev, I2C_CONF_VIN_HOT_STANDBY);
+        if (vhs < 0) {
+            printf("  [13] VIN hot standby when V-USB has priority [Read error]\n");
+        } else {
+            printf("  [13] VIN hot standby when V-USB has priority [%s]\n",
+                   vhs ? "Enabled" : "Disabled");
+        }
+    } else {
+        printf("  [13] VIN hot standby when V-USB has priority [N/A]\n");
+    }
 	
-	// [13] Return to main menu
-    printf("  [13] Return to main menu\n");
+	// [14] Return to main menu
+    printf("  [14] Return to main menu\n");
     
     close_i2c_device(i2c_dev);
     
-    int optionCount = 13;
+    int optionCount = 14;
     
     printf("  Please input 1~%d: ", optionCount);
 	int value;
@@ -1873,7 +1903,26 @@ void other_settings(void) {
 				other_settings();
 			}
 			break;
-		case 13:// Return to main menu
+        case 13:// VIN hot standby
+            if (!vin_hot_standby_supported) {
+                printf("  VIN hot standby requires firmware v%d.%d or later.\n",
+                       FW_VIN_HOT_STANDBY_REQUIRED_MAJOR,
+                       FW_VIN_HOT_STANDBY_REQUIRED_MINOR);
+                printf("  Please update the Witty Pi 5 firmware first.\n");
+                sleep(2);
+                break;
+            }
+            if (request_input_number("Keep VIN DC/DC enabled while V-USB has priority? (0=No, 1=Yes): ", 0, 1, &input, 2)) {
+                if (i2c_set(-1, I2C_CONF_VIN_HOT_STANDBY, input)) {
+                    printf("  VIN hot standby is now %s!\n", input ? "enabled" : "disabled");
+                } else {
+                    printf("  Failed to update VIN hot standby.\n");
+                }
+            } else {
+                other_settings();
+            }
+            break;
+		case 14:// Return to main menu
             return;
         default:
             break;

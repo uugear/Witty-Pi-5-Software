@@ -103,6 +103,8 @@
                                                  
 #define I2C_CONF_SYS_CLOCK_MHZ		54	// [0x36] System clock (in MHz) for RP2350: default=48 (required for USB drive and USB-uart)
 
+#define I2C_CONF_VIN_HOT_STANDBY    55  // [0x37] Keep VIN DC/DC enabled in VUSB-first mode, 0=off, 1=on
+
 #define I2C_CONF_LAST               63  // ------
 #define I2C_ADMIN_FIRST             64  // ------
 
