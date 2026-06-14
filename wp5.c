@@ -11,6 +11,8 @@
 #include <strings.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <sys/file.h>
+#include <fcntl.h>
 
 #include "wp5lib.h"
 
@@ -33,6 +35,8 @@
 
 #define IN_USE_SCRIPT_NAME              "schedule"
 
+#define WP5_APP_LOCK_FILE "/var/lock/wittypi5_app.lock"
+
 
 typedef struct {    // The validity of scheduled startup/shutdown time
     bool valid;
@@ -46,6 +50,31 @@ typedef struct {    // The validity of scheduled startup/shutdown time
 bool running = true;
 
 int model = MODEL_UNKNOWN;
+
+static int wp5_app_lock_fd = -1;
+
+static bool acquire_wp5_app_lock(void) {
+    wp5_app_lock_fd = open(WP5_APP_LOCK_FILE, O_CREAT | O_RDWR, 0644);
+    if (wp5_app_lock_fd < 0) {
+        return false;
+    }
+
+    if (flock(wp5_app_lock_fd, LOCK_EX | LOCK_NB) < 0) {
+        close(wp5_app_lock_fd);
+        wp5_app_lock_fd = -1;
+        return false;
+    }
+
+    return true;
+}
+
+static void release_wp5_app_lock(void) {
+    if (wp5_app_lock_fd >= 0) {
+        flock(wp5_app_lock_fd, LOCK_UN);
+        close(wp5_app_lock_fd);
+        wp5_app_lock_fd = -1;
+    }
+}
 
 
 /**
@@ -267,6 +296,20 @@ static void print_scheduled_time_line(const char *label, const ScheduledTimeStat
     }
     printf("  %s: %02u %02u:%02u:%02u\n",
            label, state->date, state->hour, state->minute, state->second);
+}
+
+
+static bool run_admin_command_expect_ok(uint16_t psw_cmd, const char *action_name) {
+    uint8_t status = ADMIN_STATUS_UNKNOWN;
+    if (!run_admin_command_wait(psw_cmd, &status)) {
+        printf("  Failed to %s: no response from firmware.\n", action_name);
+        return false;
+    }
+    if (status != ADMIN_STATUS_OK) {
+        printf("  Failed to %s: admin status %u.\n", action_name, status);
+        return false;
+    }
+    return true;
 }
 
 
@@ -1256,7 +1299,9 @@ static void choose_schedule_script_legacy(void) {
     printf("--------------------------------------------------------------------------------\n");
 
     i2c_set(-1, I2C_ADMIN_DIR, DIRECTORY_SCHEDULE);
-    run_admin_command(I2C_ADMIN_PWD_CMD_LIST_FILES);
+    if (!run_admin_command_expect_ok(I2C_ADMIN_PWD_CMD_LIST_FILES, "list files")) {
+        return;
+    }
 
     char buf[DOWNLOAD_BUFFER_SIZE];
     int len = i2c_read_stream_util(-1, I2C_ADMIN_DOWNLOAD, (uint8_t *)buf, DOWNLOAD_BUFFER_SIZE - 1, '>');
@@ -1278,7 +1323,9 @@ static void choose_schedule_script_legacy(void) {
         pack_filename_legacy(buf, buf);
         i2c_set(-1, I2C_ADMIN_DIR, DIRECTORY_SCHEDULE);
         i2c_write_stream_util(-1, I2C_ADMIN_UPLOAD, (uint8_t *)buf, DOWNLOAD_BUFFER_SIZE, '>');
-        run_admin_command(I2C_ADMIN_PWD_CMD_CHOOSE_SCRIPT);
+        if (!run_admin_command_expect_ok(I2C_ADMIN_PWD_CMD_CHOOSE_SCRIPT, "choose script")) {
+            return;
+        }
 
         sleep(1);
         int detected_model = MODEL_UNKNOWN;
@@ -1745,9 +1792,17 @@ void other_settings(void) {
     printf("  [ 9] I-OUT adjustment [%+.3fA]\n", ioutAdj_float);
 	
 	// [10] Power source priority
-    uint8_t psp = i2c_get(i2c_dev, I2C_CONF_PS_PRIORITY);
-    printf("  [10] Power source priority [%s first]\n", psp ? "V-IN" : "V-USB");
-	
+    int psp = i2c_get(i2c_dev, I2C_CONF_PS_PRIORITY);
+    if (psp == 0) {
+        printf("  [10] Power source priority [V-USB first]\n");
+    } else if (psp == 1) {
+        printf("  [10] Power source priority [V-IN first]\n");
+    } else if (psp < 0) {
+        printf("  [10] Power source priority [Read error]\n");
+    } else {
+        printf("  [10] Power source priority [Invalid: %d]\n", psp);
+    }
+
 	// [11] Watchdog
     uint8_t wdg = i2c_get(i2c_dev, I2C_CONF_WATCHDOG);
 	if (wdg) {
@@ -1967,49 +2022,91 @@ void reset_data(void) {
     
     switch (value) {
         case 1:	// Clear scheduled startup time
-			clear_startup_time();
-			printf("  Scheduled startup time is cleared!\n");
+			if (clear_startup_time()) {
+                printf("  Scheduled startup time is cleared!\n");
+            } else {
+                printf("  Failed to clear startup time!\n");
+            }
             return;
         case 2:	// Clear scheduled shutdown time
-			clear_shutdown_time();
-			printf("  Scheduled shutdown time is cleared!\n");
+			if (clear_shutdown_time()) {
+                printf("  Scheduled shutdown time is cleared!\n");
+            } else {
+                printf("  Failed to clear shutdown time!\n");
+            }
             return;
 		case 3:	// Stop using schedule script
-			run_admin_command(I2C_ADMIN_PWD_CMD_PURGE_SCRIPT);
+            if (run_admin_command_expect_ok(I2C_ADMIN_PWD_CMD_PURGE_SCRIPT, "stop using schedule script")) {
+                printf("  Schedule script is not being used now!\n");
+            }
 			return;
 		case 4:	// Clear low-voltage threshold
-			i2c_set(-1, I2C_CONF_LOW_VOLTAGE, 0);
-			printf("  Low-voltage threshold is cleared!\n");
+			if (i2c_set(-1, I2C_CONF_LOW_VOLTAGE, 0)) {
+                printf("  Low-voltage threshold is cleared!\n");
+            } else {
+                printf("  Failed to clear low-voltage threshold!\n");
+            }
             return;
 		case 5:	// Clear recovery-voltage threshold
-			i2c_set(-1, I2C_CONF_RECOVERY_VOLTAGE, 0);
-			printf("  Recovery-voltage threshold is cleared!\n");
+			if (i2c_set(-1, I2C_CONF_RECOVERY_VOLTAGE, 0)) {
+                printf("  Recovery-voltage threshold is cleared!\n");
+            } else {
+                printf("  Failed to clear recovery-voltage threshold!\n");
+            }
             return;
 		case 6: // Clear over-temperature action
-			i2c_set(-1, I2C_CONF_OVER_TEMP_ACTION, 0);
-			printf("  Over-temperature action is cleared!\n");
+			if (i2c_set(-1, I2C_CONF_OVER_TEMP_ACTION, 0)) {
+                printf("  Over-temperature action is cleared!\n");
+            } else {
+                printf("  Failed to clear over-temperature action!\n");
+            }
             return;
 		case 7: // Clear below-temperature action
-			i2c_set(-1, I2C_CONF_BELOW_TEMP_ACTION, 0);
-			printf("  Below-temperature action is cleared!\n");
+			if (i2c_set(-1, I2C_CONF_BELOW_TEMP_ACTION, 0)) {
+                printf("  Below-temperature action is cleared!\n");
+            } else {
+                printf("  Failed to clear below-temperature action!\n");
+            }
             return;
         case 8: // Reset all configuration values
-            run_admin_command(I2C_ADMIN_PWD_CMD_RESET_CONF);
-            printf("  All configuration values are reset!\n");
+            if (run_admin_command_expect_ok(I2C_ADMIN_PWD_CMD_RESET_CONF, "reset all configurations")) {
+                printf("  All configuration values are reset!\n");
+            }
             return;
 		case 9: // Perform all actions above
-			clear_startup_time();
-			clear_shutdown_time();
-			run_admin_command(I2C_ADMIN_PWD_CMD_PURGE_SCRIPT);
+			if (!clear_startup_time()) {
+                printf("  Failed to clear startup time!\n");
+                return;
+            }
+			if (!clear_shutdown_time()) {
+                printf("  Failed to clear shutdown time!\n");
+                return;
+            }
+            if (!run_admin_command_expect_ok(I2C_ADMIN_PWD_CMD_PURGE_SCRIPT, "stop using schedule script")) {
+                return;
+            }
 			int i2c_dev = open_i2c_device();
 			if (i2c_dev >= 0) {
-				i2c_set(i2c_dev, I2C_CONF_LOW_VOLTAGE, 0);
-				i2c_set(i2c_dev, I2C_CONF_RECOVERY_VOLTAGE, 0);
-				i2c_set(i2c_dev, I2C_CONF_OVER_TEMP_ACTION, 0);
-				i2c_set(i2c_dev, I2C_CONF_BELOW_TEMP_ACTION, 0);
+				if (!i2c_set(i2c_dev, I2C_CONF_LOW_VOLTAGE, 0)) {
+                    printf("  Failed to clear low-voltage threshold!\n");
+                }
+				if (!i2c_set(i2c_dev, I2C_CONF_RECOVERY_VOLTAGE, 0)) {
+                    printf("  Failed to clear recovery-voltage threshold!\n");
+                }
+				if (!i2c_set(i2c_dev, I2C_CONF_OVER_TEMP_ACTION, 0)) {
+                    printf("  Failed to clear over-temperature action!\n");
+                }
+				if (!i2c_set(i2c_dev, I2C_CONF_BELOW_TEMP_ACTION, 0)) {
+                    printf("  Failed to clear below-temperature action!\n");
+                }
 				close_i2c_device(i2c_dev);
-			}
-			run_admin_command(I2C_ADMIN_PWD_CMD_RESET_CONF);
+			} else {
+                printf("  Can not access I2C device!\n");
+                return;
+            }
+            if (!run_admin_command_expect_ok(I2C_ADMIN_PWD_CMD_RESET_CONF, "reset all configurations")) {
+                return;
+            }
 			printf("  All cleared!\n");
 			return;
 		case 10: // Return to main menu
@@ -2063,21 +2160,24 @@ void administrate(void) {
 
     switch (value) {
         case 1:
-            run_admin_command(I2C_ADMIN_PWD_CMD_PRINT_PRODUCT_INFO);
-            printf("  Product information is printed!\n\n");
+            if (run_admin_command_expect_ok(I2C_ADMIN_PWD_CMD_PRINT_PRODUCT_INFO, "print product information")) {
+                printf("  Product information is printed in log!\n\n");
+            }
             break;
         case 2:
             if (user_confirm("All data on Witty Pi disk will be erased! Are you sure?", 2)) {
-                run_admin_command(I2C_ADMIN_PWD_CMD_FORMAT_DISK);
-                printf("  Witty Pi disk is formatted!\n\n");
+                if (run_admin_command_expect_ok(I2C_ADMIN_PWD_CMD_FORMAT_DISK, "format Witty Pi disk")) {
+                    printf("  Witty Pi disk is formatted!\n\n");
+                }
             } else {
                 printf("  Task is cancelled.\n\n");
             }
             break;
         case 3:
             if (user_confirm("Do you want to reset the RTC?", 2)) {
-                run_admin_command(I2C_ADMIN_PWD_CMD_RESET_RTC);
-                printf("  RTC is reset!\n\n");
+                if(run_admin_command_expect_ok(I2C_ADMIN_PWD_CMD_RESET_RTC, "reset RTC")) {
+                    printf("  RTC is reset!\n\n");
+                }
             } else {
                 printf("  Task is cancelled.\n\n");
             }
@@ -2092,34 +2192,40 @@ void administrate(void) {
                 break;
             }
             if (input) {
-                run_admin_command(I2C_ADMIN_PWD_CMD_ENABLE_ID_EEPROM_WP);
-                printf("  ID EEPROM write protection is ON.\n\n");
+                if (run_admin_command_expect_ok(I2C_ADMIN_PWD_CMD_ENABLE_ID_EEPROM_WP, "turn on ID EEPROM write protection")) {
+                    printf("  ID EEPROM write protection is ON.\n\n");
+                }
             } else {
-                run_admin_command(I2C_ADMIN_PWD_CMD_DISABLE_ID_EEPROM_WP);
-                printf("  ID EEPROM write protection is OFF.\n\n");
+                if (run_admin_command_expect_ok(I2C_ADMIN_PWD_CMD_DISABLE_ID_EEPROM_WP, "turn off ID EEPROM write protection")) {
+                    printf("  ID EEPROM write protection is OFF.\n\n");
+                }
             }
             break;
         }
         case 5:
-            run_admin_command(I2C_ADMIN_PWD_CMD_SYNC_CONF);
-            printf("  Configuration is synchronized to file on Witty Pi.\n\n");
+            if (run_admin_command_expect_ok(I2C_ADMIN_PWD_CMD_SYNC_CONF, "synchronize configuration with file")) {
+                printf("  Configuration is synchronized to file on Witty Pi.\n\n");
+            }
             break;
         case 6:
-            run_admin_command(I2C_ADMIN_PWD_CMD_SAVE_LOG);
-            printf("  Log is saved to file on Witty Pi.\n\n");
+            if (run_admin_command_expect_ok(I2C_ADMIN_PWD_CMD_SAVE_LOG, "save log to file")) {
+                printf("  Log is saved to file on Witty Pi.\n\n");
+            }
             break;
         case 7:
             if (file_admin_supported) {
                 download_log_file();
             } else {
-                run_admin_command(I2C_ADMIN_PWD_CMD_LOAD_SCRIPT);
-                printf("  Load schedule.wpi and generate .act and .skd files.\n\n");
+                if (run_admin_command_expect_ok(I2C_ADMIN_PWD_CMD_LOAD_SCRIPT, "load schedule script")) {
+                    printf("  Load schedule.wpi and generate .act and .skd files.\n\n");
+                }
             }
             break;
         case 8:
             if (file_admin_supported) {
-                run_admin_command(I2C_ADMIN_PWD_CMD_LOAD_SCRIPT);
-                printf("  Load schedule.wpi and generate .act and .skd files.\n\n");
+                if (run_admin_command_expect_ok(I2C_ADMIN_PWD_CMD_LOAD_SCRIPT, "load schedule script")) {
+                    printf("  Load schedule.wpi and generate .act and .skd files.\n\n");
+                }
             } else {
                 return;
             }
@@ -2264,7 +2370,13 @@ void do_main_menu(void) {
  * Main function
  */
 int main(int argc, char *argv[]) {
-    
+
+    if (!acquire_wp5_app_lock()) {
+        printf("Another wp5 instance is already running. Please close it first.\n");
+        return 1;
+    }
+
+    atexit(release_wp5_app_lock);
     
     // Process --debug arguments
     bool debug = false;

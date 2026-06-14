@@ -35,6 +35,8 @@
 #define I2C_READ_MAX_ATTEMPTS   		10
 #define I2C_READ_VALIDATE_COUNT   		2
 
+#define ADMIN_COMMAND_TIMEOUT_MS        8000
+#define ADMIN_STATUS_CLIENT_PENDING     0xFF
 
 static LogMode log_mode = LOG_WITH_TIME;
 
@@ -1235,27 +1237,6 @@ bool set_recovery_voltage_threshold(float threshold) {
 
 
 /**
- * Run administrative command
- * 
- * @param psw_cmd The 16 bit integer that stores password and command
- * @return true if succeed, false if fail
- */
-bool run_admin_command(uint16_t psw_cmd) {
-	int i2c_dev = open_i2c_device();
-    if (i2c_dev < 0) {
-        return false;
-    }
-    bool result = true;
-	uint8_t psw = (psw_cmd >> 8);
-	uint8_t cmd = (psw_cmd & 0xFF);
-	result &= i2c_set(i2c_dev, I2C_ADMIN_PASSWORD, psw);
-	result &= i2c_set_impl(i2c_dev, I2C_ADMIN_COMMAND, cmd, false);
-    close_i2c_device(i2c_dev);
-    return result;
-}
-
-
-/**
  * Run administrative command and wait for completion.
  *
  * @param psw_cmd The 16 bit integer that stores password and command
@@ -1263,53 +1244,76 @@ bool run_admin_command(uint16_t psw_cmd) {
  * @return true if the command was issued and a terminal status was observed, false otherwise
  */
 bool run_admin_command_wait(uint16_t psw_cmd, uint8_t *status) {
+    if (status) {
+        *status = ADMIN_STATUS_UNKNOWN;
+    }
+
     int i2c_dev = open_i2c_device();
     if (i2c_dev < 0) {
         return false;
     }
 
-    int initial = i2c_get_impl(i2c_dev, I2C_ADMIN_CONTEXT, false);
-    uint8_t psw = (uint8_t)(psw_cmd >> 8);
-    uint8_t cmd = (uint8_t)(psw_cmd & 0xFF);
-    bool result = true;
-    result &= i2c_set(i2c_dev, I2C_ADMIN_PASSWORD, psw);
-    result &= i2c_set_impl(i2c_dev, I2C_ADMIN_COMMAND, cmd, false);
-    if (!result) {
-        close_i2c_device(i2c_dev);
-        return false;
-    }
-
     int waited_ms = 0;
-    int prev = -1;
-    bool started = false;
-    int current = initial;
 
-    while (waited_ms <= 8000) {
-        current = i2c_get_impl(i2c_dev, I2C_ADMIN_CONTEXT, false);
-        if (current == ADMIN_STATUS_BUSY) {
-            started = true;
-            prev = -1;
-        } else if (current >= 0) {
-            if (!started && current == initial) {
-                prev = -1;
-            } else {
-                started = true;
-                if (current == prev) {
-                    if (status) {
-                        *status = (uint8_t)current;
-                    }
-                    close_i2c_device(i2c_dev);
-                    return true;
-                }
-                prev = current;
-            }
+    // Wait for any previous command to finish before issuing a new one.
+    while (waited_ms <= ADMIN_COMMAND_TIMEOUT_MS) {
+        int current = i2c_get_impl(i2c_dev, I2C_ADMIN_CONTEXT, false);
+        if (current != ADMIN_STATUS_BUSY) {
+            break;
         }
         usleep(10000);
         waited_ms += 10;
     }
 
+    if (waited_ms > ADMIN_COMMAND_TIMEOUT_MS) {
+        if (status) {
+            *status = ADMIN_STATUS_BUSY;
+        }
+        close_i2c_device(i2c_dev);
+        return false;
+    }
+
+    // Mark this command as pending from the client's point of view.
+    if (!i2c_set_impl(i2c_dev, I2C_ADMIN_CONTEXT, ADMIN_STATUS_CLIENT_PENDING, false)) {
+        if (status) {
+            *status = ADMIN_STATUS_UNKNOWN;
+        }
+        close_i2c_device(i2c_dev);
+        return false;
+    }
+
+    uint8_t psw = (uint8_t)(psw_cmd >> 8);
+    uint8_t cmd = (uint8_t)(psw_cmd & 0xFF);
+
+    bool result = true;
+    result &= i2c_set(i2c_dev, I2C_ADMIN_PASSWORD, psw);
+    result &= i2c_set_impl(i2c_dev, I2C_ADMIN_COMMAND, cmd, false);
+
+    if (!result) {
+        close_i2c_device(i2c_dev);
+        return false;
+    }
+
+    waited_ms = 0;
+    while (waited_ms <= ADMIN_COMMAND_TIMEOUT_MS) {
+        int current = i2c_get_impl(i2c_dev, I2C_ADMIN_CONTEXT, false);
+
+        if (current >= 0 &&
+            current != ADMIN_STATUS_CLIENT_PENDING &&
+            current != ADMIN_STATUS_BUSY) {
+            if (status) {
+                *status = (uint8_t)current;
+            }
+            close_i2c_device(i2c_dev);
+            return true;
+        }
+
+        usleep(10000);
+        waited_ms += 10;
+    }
+
     if (status) {
-        *status = (uint8_t)((current < 0) ? 0xFF : current);
+        *status = ADMIN_STATUS_BUSY;
     }
     close_i2c_device(i2c_dev);
     return false;

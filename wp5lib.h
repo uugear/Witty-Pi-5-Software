@@ -10,8 +10,8 @@
 #define BIT_VALUE(bit) (1 << (bit))
 
 #define SOFTWARE_VERSION_MAJOR	5
-#define SOFTWARE_VERSION_MINOR	1
-#define SOFTWARE_VERSION_PATCH  1
+#define SOFTWARE_VERSION_MINOR	2
+#define SOFTWARE_VERSION_PATCH  0
 
 #define SOFTWARE_VERSION_STR    TO_STRING(SOFTWARE_VERSION_MAJOR) "." TO_STRING(SOFTWARE_VERSION_MINOR) "." TO_STRING(SOFTWARE_VERSION_PATCH)
 
@@ -186,6 +186,7 @@
 #define ADMIN_STATUS_FILE_TOO_LARGE                 0x05
 #define ADMIN_STATUS_INVALID_DIRECTORY              0x06
 #define ADMIN_STATUS_BUSY                           0xFE
+#define ADMIN_STATUS_UNKNOWN                        0xFF
 
 
 /*
@@ -632,15 +633,6 @@ float get_recovery_voltage_threshold(void);
  * @return true if succeed, false if fail
  */
 bool set_recovery_voltage_threshold(float threshold);
-
-
-/**
- * Run administrative command
- * 
- * @param psw_cmd The 16 bit integer that stores password and command
- * @return true if succeed, false if fail
- */
-bool run_admin_command(uint16_t psw_cmd);
 
 
 /**
