@@ -771,7 +771,7 @@ static bool read_download_chunk_packet(int i2c_dev, uint8_t *content, int max_co
 }
 
 
-static bool download_remote_file(uint8_t dir, const char *remote_filename, const char *local_path) {
+static bool start_remote_download(uint8_t dir, const char *remote_filename, uint8_t *status) {
     uint8_t packet[MAX_FILENAME_LENGTH + 8];
     size_t packet_len = 0;
     if (!pack_filename_hex(remote_filename, packet, sizeof(packet), &packet_len)) {
@@ -783,11 +783,25 @@ static bool download_remote_file(uint8_t dir, const char *remote_filename, const
     if (!send_bytes_to_admin_upload(packet, packet_len)) {
         return false;
     }
+    usleep(1000);
+    return run_admin_command_wait(I2C_ADMIN_PWD_CMD_FILE_DOWNLOAD, status);
+}
 
-    uint8_t status = 0xFF;
-    if (!run_admin_command_wait(I2C_ADMIN_PWD_CMD_FILE_DOWNLOAD, &status) || status != ADMIN_STATUS_OK) {
-        printf("  Download failed: %s\n", admin_status_text(status));
-        return false;
+
+static bool download_remote_file(uint8_t dir, const char *remote_filename, const char *local_path) {
+    uint8_t status = ADMIN_STATUS_UNKNOWN;
+    if (!start_remote_download(dir, remote_filename, &status) || status != ADMIN_STATUS_OK) {
+        if (status == ADMIN_STATUS_INVALID_PACKET) {
+            printf("  Retrying...\n");
+            usleep(10000);
+            if (!start_remote_download(dir, remote_filename, &status) || status != ADMIN_STATUS_OK) {
+                printf("  Download failed: %s\n", admin_status_text(status));
+                return false;
+            }
+        } else {
+            printf("  Download failed: %s\n", admin_status_text(status));
+            return false;
+        }
     }
 
     FILE *fp = fopen(local_path, "wb");
