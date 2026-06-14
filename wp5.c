@@ -1001,17 +1001,25 @@ static void download_log_file(void);
  * Display the information bar
  */
 void do_info_bar(void) {
-    int model = get_wittypi_model();
+    model = get_wittypi_model();
     if (model == MODEL_UNKNOWN) {
         printf("Can not detect Witty Pi, exiting...\n");
 		exit(0);
     }
 
     printf("--------------------------------------------------------------------------------\n");
-    printf("  Model: %s", wittypi_models[model]);
+    int fw_major = 0;
+    int fw_minor = 0;
+    bool has_fw_version = get_firmware_version(&fw_major, &fw_minor);
+    if (has_fw_version) {
+        printf("  Model: %s (firmware v%d.%d)\n", wittypi_models[model], fw_major, fw_minor);
+    } else {
+        printf("  Model: %s\n", wittypi_models[model]);
+    }
+
     float celsius = get_temperature();
     float fahrenheit = celsius_to_fahrenheit(celsius);
-	printf("   Temperature: %.3f°C / %.3f°F\n", celsius, fahrenheit);
+	printf("  Temperature: %.3f°C / %.3f°F\n", celsius, fahrenheit);
     int mode = get_power_mode();
     if (mode == 0) {
         printf("  V-USB: %.3fV", get_vusb());
