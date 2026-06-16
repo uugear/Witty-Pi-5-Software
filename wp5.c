@@ -2092,13 +2092,16 @@ void reset_data(void) {
                 printf("  Failed to clear startup time!\n");
                 return;
             }
+            usleep(100000);
 			if (!clear_shutdown_time()) {
                 printf("  Failed to clear shutdown time!\n");
                 return;
             }
+            usleep(100000);
             if (!run_admin_command_expect_ok(I2C_ADMIN_PWD_CMD_PURGE_SCRIPT, "stop using schedule script")) {
                 return;
             }
+            usleep(100000);
 			int i2c_dev = open_i2c_device();
 			if (i2c_dev >= 0) {
 				if (!i2c_set(i2c_dev, I2C_CONF_LOW_VOLTAGE, 0)) {
@@ -2118,6 +2121,7 @@ void reset_data(void) {
                 printf("  Can not access I2C device!\n");
                 return;
             }
+            usleep(100000);
             if (!run_admin_command_expect_ok(I2C_ADMIN_PWD_CMD_RESET_CONF, "reset all configurations")) {
                 return;
             }
