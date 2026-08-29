@@ -294,8 +294,10 @@ int open_i2c_device(void) {
 
     if (ioctl(i2c_dev, I2C_SLAVE, I2C_SLAVE_ADDR) < 0) {
         print_log("Failed setting I2C slave device address.\n");
+        close(i2c_dev);
         return -1;
     }
+
     return i2c_dev;
 }
 
@@ -857,19 +859,40 @@ int get_power_mode(void) {
  * @return Temperature in Celsius degree, -1000.0 if error
  */
 float get_temperature(void) {
-	int dev = open_i2c_device();
+    int dev = open_i2c_device();
     if (dev < 0) {
         return -1000.0f;
     }
-	int msb = i2c_get_impl(dev, I2C_VREG_TMP112_TEMP_MSB, false);
-    int lsb = i2c_get_impl(dev, I2C_VREG_TMP112_TEMP_LSB, false);
-	if (msb < 0 || lsb < 0) {
-		return -1000.0f;
-	}
-	int16_t raw = (msb << 4) | (lsb >> 4);
+
+    int msb = i2c_get_impl(
+        dev,
+        I2C_VREG_TMP112_TEMP_MSB,
+        false
+    );
+
+    if (msb < 0) {
+        close_i2c_device(dev);
+        return -1000.0f;
+    }
+
+    int lsb = i2c_get_impl(
+        dev,
+        I2C_VREG_TMP112_TEMP_LSB,
+        false
+    );
+
+    close_i2c_device(dev);
+
+    if (lsb < 0) {
+        return -1000.0f;
+    }
+
+    int16_t raw = (msb << 4) | (lsb >> 4);
+
     if (raw & 0x800) {
         raw |= 0xF000;
     }
+
     return (float)((int32_t)raw * 625) / 10000.0f;
 }
 
@@ -891,9 +914,23 @@ float get_thousandth(uint8_t msb_index, uint8_t lsb_index) {
     if (dev < 0) {
         return -1.0f;
     }
-    int msb = i2c_get_impl(dev, msb_index, false) & 0x7F;
+
+    int msb = i2c_get_impl(dev, msb_index, false);
+    if (msb < 0) {
+        close_i2c_device(dev);
+        return -1.0f;
+    }
+
     int lsb = i2c_get_impl(dev, lsb_index, false);
-    close(dev);
+
+    close_i2c_device(dev);
+
+    if (lsb < 0) {
+        return -1.0f;
+    }
+
+    msb &= 0x7F;
+
     return (float)((msb << 8) | lsb) / 1000.0f;
 }
 
@@ -1580,7 +1617,10 @@ bool get_firmware_version(int *major, int *minor) {
  */
 bool is_script_in_use(void) {
     int misc = i2c_get(-1, I2C_MISC);
-    return misc & 0x01;
+    if (misc < 0) {
+        return false;
+    }
+    return (misc & 0x01) != 0;
 }
 
 
