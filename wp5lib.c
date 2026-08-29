@@ -24,9 +24,6 @@
 #include "wp5lib.h"
 
 
-#define ACQUIRE_I2C_LOCK_MAX_ATTEMPTS   5
-#define ACQUIRE_I2C_LOCK_INTERVAL_US    200000
-
 #define I2C_POST_WRITE_SETTLE_DELAY_US  1000
 
 #define I2C_WRITE_MAX_ATTEMPTS			10
@@ -179,26 +176,32 @@ uint8_t calculate_crc8(const uint8_t *data, size_t len) {
 
 
 // Acquire I2C lock
-int lock_file() {
-    int lock_fd = -1;
-    int attempts = 0;
-    while (lock_fd < 0) {
-        attempts ++;
-        mode_t old_umask = umask(0);
-        lock_fd = open(I2C_LOCK, O_CREAT | O_RDWR, 0666);
-        umask(old_umask);
-        if (lock_fd < 0) {
-            print_log("Failed to open lock file %s\n", I2C_LOCK);
-            return -1;
+int lock_file(void) {
+    mode_t old_umask = umask(0);
+    int lock_fd = open(I2C_LOCK, O_CREAT | O_RDWR, 0666);
+    int open_errno = errno;
+    umask(old_umask);
+
+    if (lock_fd < 0) {
+        print_log(
+            "Failed to open I2C lock file %s: %s\n",
+            I2C_LOCK,
+            strerror(open_errno)
+        );
+        return -1;
+    }
+
+    while (flock(lock_fd, LOCK_EX) < 0) {
+        if (errno == EINTR) {
+            continue;
         }
-        if (flock(lock_fd, LOCK_EX) < 0) {
-            print_log("Failed to acquire I2C lock\n");
-            close(lock_fd);
-            if (attempts >= ACQUIRE_I2C_LOCK_MAX_ATTEMPTS) {
-                return -1;
-            }
-            usleep(ACQUIRE_I2C_LOCK_INTERVAL_US);
-        }
+        int lock_errno = errno;
+        close(lock_fd);
+        print_log(
+            "Failed to acquire I2C lock: %s\n",
+            strerror(lock_errno)
+        );
+        return -1;
     }
     return lock_fd;
 }
@@ -206,6 +209,10 @@ int lock_file() {
 
 // Release I2C lock
 void unlock_file(int lock_fd) {
+    if (lock_fd < 0) {
+        return;
+    }
+
     flock(lock_fd, LOCK_UN);
     close(lock_fd);
 }
