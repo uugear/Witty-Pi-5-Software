@@ -26,10 +26,9 @@
 
 #define I2C_POST_WRITE_SETTLE_DELAY_US  1000
 
-#define I2C_WRITE_MAX_ATTEMPTS			10
+#define I2C_RETRY_TIMEOUT_MS            3000
+#define I2C_RETRY_DELAY_US              20000
 #define I2C_WRITE_VALIDATE_DELAY_US     100
-
-#define I2C_READ_MAX_ATTEMPTS   		10
 #define I2C_READ_VALIDATE_COUNT   		2
 
 #define ADMIN_COMMAND_TIMEOUT_MS        8000
@@ -62,6 +61,69 @@ const char *action_reasons[] = {
 	"Reboot Externally",
 };
 const int action_reasons_count = sizeof(action_reasons) / sizeof(action_reasons[0]);
+
+
+static uint64_t monotonic_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ULL +
+           (uint64_t)ts.tv_nsec / 1000000ULL;
+}
+
+
+static bool i2c_read_register_unlocked(
+    int i2c_dev,
+    uint8_t index,
+    uint8_t *value
+) {
+    uint8_t read_buffer[1];
+    uint8_t read_addr_buffer[1] = { index };
+
+    struct i2c_msg msgs[2];
+    struct i2c_rdwr_ioctl_data msgs_data;
+
+    msgs[0].addr = I2C_SLAVE_ADDR;
+    msgs[0].flags = 0;
+    msgs[0].len = 1;
+    msgs[0].buf = read_addr_buffer;
+
+    msgs[1].addr = I2C_SLAVE_ADDR;
+    msgs[1].flags = I2C_M_RD;
+    msgs[1].len = 1;
+    msgs[1].buf = read_buffer;
+
+    msgs_data.msgs = msgs;
+    msgs_data.nmsgs = 2;
+
+    if (ioctl(i2c_dev, I2C_RDWR, &msgs_data) < 0) {
+        return false;
+    }
+
+    *value = read_buffer[0];
+    return true;
+}
+
+
+static bool i2c_write_register_unlocked(
+    int i2c_dev,
+    uint8_t index,
+    uint8_t value
+) {
+    uint8_t buffer[2] = { index, value };
+
+    struct i2c_msg msg;
+    struct i2c_rdwr_ioctl_data msgs_data;
+
+    msg.addr = I2C_SLAVE_ADDR;
+    msg.flags = 0;
+    msg.len = 2;
+    msg.buf = buffer;
+
+    msgs_data.msgs = &msg;
+    msgs_data.nmsgs = 1;
+
+    return ioctl(i2c_dev, I2C_RDWR, &msgs_data) >= 0;
+}
 
 
 /**
@@ -249,6 +311,7 @@ int open_i2c_device(void) {
  */
 int i2c_get_impl(int i2c_dev, uint8_t index, bool validate) {
     bool need_to_close = false;
+
     if (i2c_dev < 0) {
         i2c_dev = open_i2c_device();
         if (i2c_dev < 0) {
@@ -259,86 +322,109 @@ int i2c_get_impl(int i2c_dev, uint8_t index, bool validate) {
     }
 
     int value = -1;
-    int attempts = 0;
-    int same_value_count = 0;
+    bool have_last_value = false;
     uint8_t last_read_value = 0;
+    int same_value_count = 0;
 
-    while (attempts < I2C_READ_MAX_ATTEMPTS && same_value_count < (validate ? I2C_READ_VALIDATE_COUNT : 1)) {
-        attempts++;
+    int last_io_errno = 0;
+    int successful_reads = 0;
 
+    uint64_t deadline_ms = 0;
+
+    while (true) {
         int lock_fd = lock_file();
         if (lock_fd < 0) {
-            print_log("i2c_get: failed to lock I2C device.\n");
-            usleep(1000);
-            continue;
+            break;
         }
 
-        uint8_t read_buffer[1];
-        uint8_t read_addr_buffer[1];
-        read_addr_buffer[0] = index;
+        uint8_t current_read_value = 0;
+        bool read_ok = i2c_read_register_unlocked(
+            i2c_dev,
+            index,
+            &current_read_value
+        );
 
-        struct i2c_msg msgs[2];
-        struct i2c_rdwr_ioctl_data msgs_data;
-
-        msgs[0].addr = I2C_SLAVE_ADDR;
-        msgs[0].flags = 0;
-        msgs[0].len = 1;
-        msgs[0].buf = read_addr_buffer;
-
-        msgs[1].addr = I2C_SLAVE_ADDR;
-        msgs[1].flags = I2C_M_RD;
-        msgs[1].len = 1;
-        msgs[1].buf = read_buffer;
-
-        msgs_data.msgs = msgs;
-        msgs_data.nmsgs = 2;
-
-        if (ioctl(i2c_dev, I2C_RDWR, &msgs_data) < 0) {
-            print_log("i2c_get: read transaction failed for Reg%d on attempt %d: %s\n", index, attempts, strerror(errno));
-            unlock_file(lock_fd);
-            usleep(1000);
-            if (validate) {
-                continue;
-            }
-        }
+        int io_errno = read_ok ? 0 : errno;
 
         unlock_file(lock_fd);
 
-        uint8_t current_read_value = read_buffer[0];
+        if (!read_ok) {
+            last_io_errno = io_errno;
 
-        if (validate) {
-            if (attempts == 1) {
-                 last_read_value = current_read_value;
-                 same_value_count = 1;
-            } else {
-                if (current_read_value == last_read_value) {
-                    same_value_count++;
-                } else {
-                    print_log("i2c_get: Reg%d value changed from 0x%02x to 0x%02x on attempt %d.\n", index, last_read_value, current_read_value, attempts);
-                    last_read_value = current_read_value;
-                    same_value_count = 1;
-                }
+            /*
+             * Validation requires consecutive successful reads.
+             * Do not bridge an I2C communication failure.
+             */
+            have_last_value = false;
+            same_value_count = 0;
+
+            uint64_t now = monotonic_ms();
+
+            if (deadline_ms == 0) {
+                deadline_ms = now + I2C_RETRY_TIMEOUT_MS;
+            } else if (now >= deadline_ms) {
+                break;
             }
-        } else {
+
+            usleep(I2C_RETRY_DELAY_US);
+            continue;
+        }
+
+        successful_reads++;
+
+        if (!validate) {
             value = current_read_value;
             break;
         }
 
-        if (validate && same_value_count >= I2C_READ_VALIDATE_COUNT) {
-             value = current_read_value;
-             break;
+        if (!have_last_value) {
+            last_read_value = current_read_value;
+            have_last_value = true;
+            same_value_count = 1;
+        } else if (current_read_value == last_read_value) {
+            same_value_count++;
+        } else {
+            last_read_value = current_read_value;
+            same_value_count = 1;
+
+            uint64_t now = monotonic_ms();
+
+            if (deadline_ms == 0) {
+                deadline_ms = now + I2C_RETRY_TIMEOUT_MS;
+            } else if (now >= deadline_ms) {
+                break;
+            }
+        }
+
+        if (same_value_count >= I2C_READ_VALIDATE_COUNT) {
+            value = current_read_value;
+            break;
         }
     }
-    if (attempts >= I2C_READ_MAX_ATTEMPTS && (validate && same_value_count < I2C_READ_VALIDATE_COUNT)) {
-        print_log("i2c_get: Failed to get stable reading for Reg%d after %d attempts.\n", index, attempts);
-        value = -1;
+
+    if (value < 0) {
+        if (successful_reads == 0 && last_io_errno != 0) {
+            print_log(
+                "i2c_get: failed to read Reg%d within %d ms: %s\n",
+                index,
+                I2C_RETRY_TIMEOUT_MS,
+                strerror(last_io_errno)
+            );
+        } else {
+            print_log(
+                "i2c_get: failed to get stable reading for Reg%d within %d ms.\n",
+                index,
+                I2C_RETRY_TIMEOUT_MS
+            );
+        }
     }
+
     if (need_to_close) {
         close(i2c_dev);
     }
+
     return value;
 }
-
 
 
 /**
@@ -353,6 +439,33 @@ int i2c_get(int i2c_dev, uint8_t index) {
 }
 
 
+static int i2c_get_once(int i2c_dev, uint8_t index) {
+    int lock_fd = lock_file();
+    if (lock_fd < 0) {
+        return -1;
+    }
+
+    uint8_t value = 0;
+
+    bool success = i2c_read_register_unlocked(
+        i2c_dev,
+        index,
+        &value
+    );
+
+    int io_errno = success ? 0 : errno;
+
+    unlock_file(lock_fd);
+
+    if (!success) {
+        errno = io_errno;
+        return -1;
+    }
+
+    return value;
+}
+
+
 /**
  * Read data from specific I2C register until expected value is read
  * 
@@ -363,8 +476,15 @@ int i2c_get(int i2c_dev, uint8_t index) {
  * @param expected The byte that would stop the reading
  * @return The length of data read, -1 if error
  */
-int i2c_read_stream_util(int i2c_dev, uint8_t index, uint8_t * buf, int size, uint8_t expected) {
+int i2c_read_stream_util(
+    int i2c_dev,
+    uint8_t index,
+    uint8_t *buf,
+    int size,
+    uint8_t expected
+) {
     bool need_to_close = false;
+
     if (i2c_dev < 0) {
         i2c_dev = open_i2c_device();
         if (i2c_dev < 0) {
@@ -373,14 +493,22 @@ int i2c_read_stream_util(int i2c_dev, uint8_t index, uint8_t * buf, int size, ui
         }
         need_to_close = true;
     }
-    int i, len;
-    for (i = 0; i < size; i ++) {
-        buf[i] = (uint8_t)i2c_get_impl(i2c_dev, index, false);
+
+    int len = -1;
+    for (int i = 0; i < size; i++) {
+        int value = i2c_get_once(i2c_dev, index);
+        if (value < 0) {
+            goto done;
+        }
+        buf[i] = (uint8_t)value;
         if (buf[i] == expected) {
-            break;
+            len = i + 1;
+            goto done;
         }
     }
-    len = i + 1;
+    len = size;
+
+done:
     if (need_to_close) {
         close(i2c_dev);
     }
@@ -397,8 +525,14 @@ int i2c_read_stream_util(int i2c_dev, uint8_t index, uint8_t * buf, int size, ui
  * @param validate Whether to validate the value
  * @return true if successfully written, false otherwise
  */
-bool i2c_set_impl(int i2c_dev, uint8_t index, uint8_t value, bool validate) {
+bool i2c_set_impl(
+    int i2c_dev,
+    uint8_t index,
+    uint8_t value,
+    bool validate
+) {
     bool need_to_close = false;
+
     if (i2c_dev < 0) {
         i2c_dev = open_i2c_device();
         if (i2c_dev < 0) {
@@ -407,115 +541,204 @@ bool i2c_set_impl(int i2c_dev, uint8_t index, uint8_t value, bool validate) {
         }
         need_to_close = true;
     }
-    bool success = true;
-    int attempts = 0;
+
+    /*
+     * Non-validated writes may target command or stream registers.
+     * Do not replay them automatically because a failed transaction
+     * may already have been partially accepted by the slave.
+     */
+    if (!validate) {
+        bool success = false;
+
+        int lock_fd = lock_file();
+        if (lock_fd >= 0) {
+            bool write_ok = i2c_write_register_unlocked(
+                i2c_dev,
+                index,
+                value
+            );
+
+            int write_errno = write_ok ? 0 : errno;
+
+            unlock_file(lock_fd);
+
+            if (write_ok) {
+                success = true;
+            } else {
+                print_log(
+                    "i2c_set: failed to write Reg%d: %s\n",
+                    index,
+                    strerror(write_errno)
+                );
+            }
+        }
+
+        if (need_to_close) {
+            close(i2c_dev);
+        }
+
+        return success;
+    }
+
+    bool success = false;
+    bool need_write = true;
+
+    /*
+     * A wrong readback is considered stable only after the same wrong
+     * value has been read successfully multiple times in succession.
+     */
+    bool have_mismatch = false;
+    uint8_t last_mismatch = 0;
+    int mismatch_count = 0;
+
+    int last_io_errno = 0;
+    bool saw_mismatch = false;
+    uint8_t last_readback = 0;
+
+    uint64_t deadline_ms = monotonic_ms() + I2C_RETRY_TIMEOUT_MS;
+
     while (true) {
-        attempts++;
-        if (attempts > I2C_WRITE_MAX_ATTEMPTS) {
-            print_log("i2c_set: too many retries, give up.\n");
-            success = false;
+        /*
+         * Do not start another retry after the operation deadline.
+         * Under normal conditions the initial attempt starts immediately,
+         * well before this deadline.
+         */
+        if (monotonic_ms() >= deadline_ms) {
             break;
         }
 
+        if (need_write) {
+            int lock_fd = lock_file();
+            if (lock_fd < 0) {
+                break;
+            }
+
+            bool write_ok = i2c_write_register_unlocked(
+                i2c_dev,
+                index,
+                value
+            );
+
+            int write_errno = write_ok ? 0 : errno;
+
+            unlock_file(lock_fd);
+
+            if (!write_ok) {
+                last_io_errno = write_errno;
+
+                usleep(I2C_RETRY_DELAY_US);
+                continue;
+            }
+
+            /*
+             * The write transaction succeeded. From this point on,
+             * communication failures during validation must not cause
+             * the write to be replayed automatically.
+             */
+            need_write = false;
+            have_mismatch = false;
+            mismatch_count = 0;
+
+            usleep(I2C_WRITE_VALIDATE_DELAY_US);
+        }
+
+        /*
+         * Validate the successful write. A communication failure here
+         * only retries the readback; it does not replay the write.
+         */
         int lock_fd = lock_file();
         if (lock_fd < 0) {
-            print_log("i2c_set: failed to lock I2C device.\n");
-            success = false;
-            usleep(1000);
+            break;
+        }
+
+        uint8_t readback = 0;
+        bool read_ok = i2c_read_register_unlocked(
+            i2c_dev,
+            index,
+            &readback
+        );
+
+        int read_errno = read_ok ? 0 : errno;
+
+        unlock_file(lock_fd);
+
+        if (!read_ok) {
+            last_io_errno = read_errno;
+
+            /*
+             * A communication failure breaks the sequence of
+             * consecutive matching readbacks.
+             */
+            have_mismatch = false;
+            mismatch_count = 0;
+
+            usleep(I2C_RETRY_DELAY_US);
             continue;
         }
 
-        if (!validate) {    // Write without validation
-            uint8_t buffer[2];
-            buffer[0] = index;
-            buffer[1] = value;
+        last_readback = readback;
 
-            struct i2c_msg msg;
-            struct i2c_rdwr_ioctl_data msgs_data;
-
-            msg.addr = I2C_SLAVE_ADDR;
-            msg.flags = 0;
-            msg.len = 2;
-            msg.buf = buffer;
-
-            msgs_data.msgs = &msg;
-            msgs_data.nmsgs = 1;
-
-            if (ioctl(i2c_dev, I2C_RDWR, &msgs_data) < 0) {
-                print_log("i2c_set: simple write failed.\n");
-                success = false;
-            }
-            unlock_file(lock_fd);
+        if (readback == value) {
+            success = true;
             break;
-        } else {            // Write and validate
-            // Write the value with 1 message
-            uint8_t write_buffer[2];
-            write_buffer[0] = index;
-            write_buffer[1] = value;
-        
-            struct i2c_msg write_msg;
-            struct i2c_rdwr_ioctl_data write_msgs_data;
-        
-            write_msg.addr = I2C_SLAVE_ADDR;
-            write_msg.flags = 0;
-            write_msg.len = 2;
-            write_msg.buf = write_buffer;
-        
-            write_msgs_data.msgs = &write_msg;
-            write_msgs_data.nmsgs = 1;
-        
-            if (ioctl(i2c_dev, I2C_RDWR, &write_msgs_data) < 0) {
-                print_log("i2c_set: Error writing I2C register.\n");
-                success = false;
-                unlock_file(lock_fd);
-                continue;
-            }
+        }
 
-            // Some delay
-            usleep(I2C_WRITE_VALIDATE_DELAY_US);
-        
-            // Read back the value with 2 messages (writing index and reading value)
-            uint8_t read_buffer[1];
-            uint8_t read_addr_buffer[1];
-            read_addr_buffer[0] = index;
-        
-            struct i2c_msg read_msgs[2];
-            struct i2c_rdwr_ioctl_data read_msgs_data;
-        
-            read_msgs[0].addr = I2C_SLAVE_ADDR;
-            read_msgs[0].flags = 0;
-            read_msgs[0].len = 1;
-            read_msgs[0].buf = read_addr_buffer;
-        
-            read_msgs[1].addr = I2C_SLAVE_ADDR;
-            read_msgs[1].flags = I2C_M_RD;
-            read_msgs[1].len = 1;
-            read_msgs[1].buf = read_buffer;
-        
-            read_msgs_data.msgs = read_msgs;
-            read_msgs_data.nmsgs = 2;
-        
-            if (ioctl(i2c_dev, I2C_RDWR, &read_msgs_data) < 0) {
-                print_log("i2c_set: Error reading I2C register for validation.\n");
-                success = false;
-                unlock_file(lock_fd);
-                continue;
-            }
-            
-            unlock_file(lock_fd);
+        saw_mismatch = true;
 
-            // Validate the value
-            if (read_buffer[0] == value) {
-                success = true;
-                break;
-            } else {
-                print_log("i2c_set: set Reg%d to 0x%02x but read back 0x%02x. Retrying...\n", index, value, read_buffer[0]);
-            }
+        if (!have_mismatch || readback != last_mismatch) {
+            last_mismatch = readback;
+            have_mismatch = true;
+            mismatch_count = 1;
+        } else {
+            mismatch_count++;
+        }
+
+        if (mismatch_count >= I2C_READ_VALIDATE_COUNT) {
+            /*
+             * The same incorrect value has been read successfully and
+             * consecutively enough times to consider the mismatch
+             * stable. Retry the write.
+             */
+            need_write = true;
+            have_mismatch = false;
+            mismatch_count = 0;
+        }
+
+        usleep(I2C_RETRY_DELAY_US);
+    }
+
+    if (!success) {
+        if (saw_mismatch) {
+            print_log(
+                "i2c_set: failed to set Reg%d to 0x%02x within %d ms "
+                "(last readback 0x%02x).\n",
+                index,
+                value,
+                I2C_RETRY_TIMEOUT_MS,
+                last_readback
+            );
+        } else if (last_io_errno != 0) {
+            print_log(
+                "i2c_set: failed to set Reg%d to 0x%02x within %d ms: %s\n",
+                index,
+                value,
+                I2C_RETRY_TIMEOUT_MS,
+                strerror(last_io_errno)
+            );
+        } else {
+            print_log(
+                "i2c_set: failed to set Reg%d to 0x%02x within %d ms.\n",
+                index,
+                value,
+                I2C_RETRY_TIMEOUT_MS
+            );
         }
     }
+
     if (need_to_close) {
         close(i2c_dev);
     }
+
     return success;
 }
 
@@ -591,36 +814,29 @@ void close_i2c_device(int i2c_dev) {
 int get_wittypi_model(void) {
     LogMode bk_mode = log_mode;
     log_mode = LOG_NONE;
+
     int dev = open_i2c_device();
     if (dev < 0) {
         log_mode = bk_mode;
         return MODEL_UNKNOWN;
     }
-    int fw_id = -1;
-    int attempts = 0;
-    while (fw_id == -1) {
-        fw_id = i2c_get_impl(dev, I2C_FW_ID, false);
-        attempts++;
-        if (fw_id != -1) {
-            break;
-        }
-        if (attempts >= 3) {
-            close_i2c_device(dev);
-            log_mode = bk_mode;
-            return MODEL_UNKNOWN;
-        }
-        usleep(100000);
-    }
+
+    int fw_id = i2c_get_impl(dev, I2C_FW_ID, false);
+
     close_i2c_device(dev);
     log_mode = bk_mode;
+
     switch (fw_id) {
         case FW_ID_WITTYPI_5:
             return MODEL_WITTYPI_5;
+
         case FW_ID_WITTYPI_5_MINI:
             return MODEL_WITTYPI_5_MINI;
+
         case FW_ID_WITTYPI_5_L3V7:
             return MODEL_WITTYPI_5_L3V7;
     }
+
     return MODEL_UNKNOWN;
 }
 
