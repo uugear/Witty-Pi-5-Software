@@ -679,4 +679,17 @@ int get_startup_reason(void);
 int get_shutdown_reason(void);
 
 
+/**
+ * Read one value from an I2C register without retrying.
+ *
+ * This should be used for stateful stream registers where a successful
+ * slave response may consume data even if the host transaction fails.
+ *
+ * @param i2c_dev The I2C device handler
+ * @param index The index of the register
+ * @return The value if read successfully, -1 otherwise
+ */
+int i2c_get_once(int i2c_dev, uint8_t index);
+
+
 #endif  /* __WP5LIB_H */

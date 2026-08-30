@@ -656,10 +656,11 @@ static bool get_remote_file_list(uint8_t dir, bool hide_in_use_script,
 
 
 static bool read_admin_stream_byte(int i2c_dev, uint8_t index, uint8_t *value) {
-    int read_value = i2c_get_impl(i2c_dev, index, false);
+    int read_value = i2c_get_once(i2c_dev, index);
     if (read_value < 0) {
         return false;
     }
+
     *value = (uint8_t)read_value;
     return true;
 }
