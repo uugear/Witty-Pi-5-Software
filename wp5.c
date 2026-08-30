@@ -655,6 +655,44 @@ static bool get_remote_file_list(uint8_t dir, bool hide_in_use_script,
 }
 
 
+typedef enum {
+    DOWNLOAD_PACKET_OK = 0,
+    DOWNLOAD_PACKET_HEADER_READ_ERROR,
+    DOWNLOAD_PACKET_HEADER_TIMEOUT,
+    DOWNLOAD_PACKET_INVALID_HEADER,
+    DOWNLOAD_PACKET_INVALID_LENGTH,
+    DOWNLOAD_PACKET_BODY_READ_ERROR,
+    DOWNLOAD_PACKET_INVALID_FRAMING,
+    DOWNLOAD_PACKET_INVALID_CRC_FIELD,
+    DOWNLOAD_PACKET_CRC_MISMATCH
+} DownloadPacketResult;
+
+
+static const char *download_packet_result_text(DownloadPacketResult result) {
+    switch (result) {
+        case DOWNLOAD_PACKET_HEADER_READ_ERROR:
+            return "I2C stream read failed while reading packet header";
+        case DOWNLOAD_PACKET_HEADER_TIMEOUT:
+            return "timed out waiting for packet header";
+        case DOWNLOAD_PACKET_INVALID_HEADER:
+            return "invalid packet header";
+        case DOWNLOAD_PACKET_INVALID_LENGTH:
+            return "invalid chunk length";
+        case DOWNLOAD_PACKET_BODY_READ_ERROR:
+            return "I2C stream read failed while reading packet body";
+        case DOWNLOAD_PACKET_INVALID_FRAMING:
+            return "invalid packet framing";
+        case DOWNLOAD_PACKET_INVALID_CRC_FIELD:
+            return "invalid CRC field";
+        case DOWNLOAD_PACKET_CRC_MISMATCH:
+            return "CRC mismatch";
+        case DOWNLOAD_PACKET_OK:
+        default:
+            return "unknown packet error";
+    }
+}
+
+
 static bool read_admin_stream_byte(int i2c_dev, uint8_t index, uint8_t *value) {
     int read_value = i2c_get_once(i2c_dev, index);
     if (read_value < 0) {
@@ -699,13 +737,22 @@ static int hex4_to_int(const uint8_t *buffer) {
 }
 
 
-static bool read_download_chunk_packet(int i2c_dev, uint8_t *content, int max_content, int *content_len) {
+static DownloadPacketResult read_download_chunk_packet(
+    int i2c_dev,
+    uint8_t *content,
+    int max_content,
+    int *content_len
+) {
     uint8_t header[6];
     bool got_header = false;
 
     for (int attempt = 0; attempt < 80; attempt++) {
-        if (!read_admin_stream_bytes(i2c_dev, I2C_ADMIN_DOWNLOAD, header, sizeof(header))) {
-            return false;
+        if (!read_admin_stream_bytes(
+                i2c_dev,
+                I2C_ADMIN_DOWNLOAD,
+                header,
+                sizeof(header))) {
+            return DOWNLOAD_PACKET_HEADER_READ_ERROR;
         }
 
         bool all_zero = true;
@@ -715,60 +762,89 @@ static bool read_download_chunk_packet(int i2c_dev, uint8_t *content, int max_co
                 break;
             }
         }
+
         if (all_zero) {
             usleep(10000);
             continue;
         }
-        if (header[0] != PACKET_BEGIN || header[5] != PACKET_DELIMITER) {
-            return false;
+
+        if (header[0] != PACKET_BEGIN ||
+            header[5] != PACKET_DELIMITER) {
+            return DOWNLOAD_PACKET_INVALID_HEADER;
         }
+
         got_header = true;
         break;
     }
 
     if (!got_header) {
-        return false;
+        return DOWNLOAD_PACKET_HEADER_TIMEOUT;
     }
 
     int chunk_len = hex4_to_int(&header[1]);
     if (chunk_len < 0 || chunk_len > max_content) {
-        return false;
+        return DOWNLOAD_PACKET_INVALID_LENGTH;
     }
 
     size_t tail_len = (size_t)chunk_len + 4;
     uint8_t tail[MAX_CHUNK_CONTENT + 4];
-    if (!read_admin_stream_bytes(i2c_dev, I2C_ADMIN_DOWNLOAD, tail, tail_len)) {
-        return false;
+
+    if (!read_admin_stream_bytes(
+            i2c_dev,
+            I2C_ADMIN_DOWNLOAD,
+            tail,
+            tail_len)) {
+        return DOWNLOAD_PACKET_BODY_READ_ERROR;
     }
-    if (tail[chunk_len] != PACKET_DELIMITER || tail[chunk_len + 3] != PACKET_END) {
-        return false;
+
+    if (tail[chunk_len] != PACKET_DELIMITER ||
+        tail[chunk_len + 3] != PACKET_END) {
+        return DOWNLOAD_PACKET_INVALID_FRAMING;
     }
 
     uint8_t packet[MAX_CHUNK_CONTENT + 10];
     memcpy(packet, header, sizeof(header));
     memcpy(packet + sizeof(header), tail, tail_len);
 
-    int hi = (tail[chunk_len + 1] >= '0' && tail[chunk_len + 1] <= '9') ? tail[chunk_len + 1] - '0' :
-             (tail[chunk_len + 1] >= 'A' && tail[chunk_len + 1] <= 'F') ? tail[chunk_len + 1] - 'A' + 10 : -1;
-    int lo = (tail[chunk_len + 2] >= '0' && tail[chunk_len + 2] <= '9') ? tail[chunk_len + 2] - '0' :
-             (tail[chunk_len + 2] >= 'A' && tail[chunk_len + 2] <= 'F') ? tail[chunk_len + 2] - 'A' + 10 : -1;
+    int hi =
+        (tail[chunk_len + 1] >= '0' &&
+         tail[chunk_len + 1] <= '9')
+            ? tail[chunk_len + 1] - '0'
+            : (tail[chunk_len + 1] >= 'A' &&
+               tail[chunk_len + 1] <= 'F')
+                ? tail[chunk_len + 1] - 'A' + 10
+                : -1;
+
+    int lo =
+        (tail[chunk_len + 2] >= '0' &&
+         tail[chunk_len + 2] <= '9')
+            ? tail[chunk_len + 2] - '0'
+            : (tail[chunk_len + 2] >= 'A' &&
+               tail[chunk_len + 2] <= 'F')
+                ? tail[chunk_len + 2] - 'A' + 10
+                : -1;
+
     if (hi < 0 || lo < 0) {
-        return false;
+        return DOWNLOAD_PACKET_INVALID_CRC_FIELD;
     }
 
     uint8_t crc_expected = (uint8_t)((hi << 4) | lo);
-    uint8_t crc_actual = calculate_crc8(packet, (size_t)(chunk_len + 7));
+    uint8_t crc_actual =
+        calculate_crc8(packet, (size_t)(chunk_len + 7));
+
     if (crc_expected != crc_actual) {
-        return false;
+        return DOWNLOAD_PACKET_CRC_MISMATCH;
     }
 
     if (chunk_len > 0 && content != NULL) {
         memcpy(content, packet + 6, (size_t)chunk_len);
     }
-    if (content_len) {
+
+    if (content_len != NULL) {
         *content_len = chunk_len;
     }
-    return true;
+
+    return DOWNLOAD_PACKET_OK;
 }
 
 
@@ -789,72 +865,224 @@ static bool start_remote_download(uint8_t dir, const char *remote_filename, uint
 }
 
 
-static bool download_remote_file(uint8_t dir, const char *remote_filename, const char *local_path) {
+static bool download_remote_file(
+    uint8_t dir,
+    const char *remote_filename,
+    const char *local_path
+) {
     uint8_t status = ADMIN_STATUS_UNKNOWN;
-    if (!start_remote_download(dir, remote_filename, &status) || status != ADMIN_STATUS_OK) {
-        if (status == ADMIN_STATUS_INVALID_PACKET) {
+    bool start_ok =
+        start_remote_download(dir, remote_filename, &status);
+
+    if (!start_ok || status != ADMIN_STATUS_OK) {
+        if (start_ok &&
+            status == ADMIN_STATUS_INVALID_PACKET) {
             printf("  Retrying...\n");
             usleep(10000);
-            if (!start_remote_download(dir, remote_filename, &status) || status != ADMIN_STATUS_OK) {
-                printf("  Download failed: %s\n", admin_status_text(status));
+
+            start_ok =
+                start_remote_download(
+                    dir,
+                    remote_filename,
+                    &status
+                );
+
+            if (!start_ok || status != ADMIN_STATUS_OK) {
+                if (!start_ok) {
+                    printf(
+                        "  Download failed while starting: "
+                        "failed to issue or complete the start command.\n"
+                    );
+                } else {
+                    printf(
+                        "  Download failed while starting: %s.\n",
+                        admin_status_text(status)
+                    );
+                }
                 return false;
             }
         } else {
-            printf("  Download failed: %s\n", admin_status_text(status));
+            if (!start_ok) {
+                printf(
+                    "  Download failed while starting: "
+                    "failed to issue or complete the start command.\n"
+                );
+            } else {
+                printf(
+                    "  Download failed while starting: %s.\n",
+                    admin_status_text(status)
+                );
+            }
             return false;
         }
     }
 
     FILE *fp = fopen(local_path, "wb");
     if (fp == NULL) {
-        printf("  Failed to open %s for writing: %s\n", local_path, strerror(errno));
+        printf(
+            "  Failed to open %s for writing: %s\n",
+            local_path,
+            strerror(errno)
+        );
         return false;
     }
 
     bool ok = true;
+
     int i2c_dev = open_i2c_device();
     if (i2c_dev < 0) {
+        printf(
+            "  Download failed: can not open I2C device.\n"
+        );
         fclose(fp);
         return false;
     }
 
     int chunk_index = 0;
     size_t total_bytes = 0;
+    bool progress_line_open = false;
+
     while (true) {
         uint8_t content[MAX_CHUNK_CONTENT];
         int content_len = 0;
-        if (!read_download_chunk_packet(i2c_dev, content, sizeof(content), &content_len)) {
+
+        DownloadPacketResult packet_result =
+            read_download_chunk_packet(
+                i2c_dev,
+                content,
+                sizeof(content),
+                &content_len
+            );
+
+        if (packet_result != DOWNLOAD_PACKET_OK) {
+            if (progress_line_open) {
+                printf("\n");
+                progress_line_open = false;
+            }
+
+            printf(
+                "  Download failed while reading chunk %d "
+                "after %zu bytes: %s.\n",
+                chunk_index + 1,
+                total_bytes,
+                download_packet_result_text(packet_result)
+            );
+
             ok = false;
             break;
         }
+
         if (content_len == 0) {
             break;
         }
-        if (fwrite(content, 1, (size_t)content_len, fp) != (size_t)content_len) {
+
+        errno = 0;
+
+        size_t written = fwrite(
+            content,
+            1,
+            (size_t)content_len,
+            fp
+        );
+
+        int write_errno = errno;
+
+        if (written != (size_t)content_len) {
+            if (progress_line_open) {
+                printf("\n");
+                progress_line_open = false;
+            }
+
+            if (ferror(fp) && write_errno != 0) {
+                printf(
+                    "  Download failed while writing chunk %d "
+                    "to %s: %s.\n",
+                    chunk_index + 1,
+                    local_path,
+                    strerror(write_errno)
+                );
+            } else {
+                printf(
+                    "  Download failed while writing chunk %d "
+                    "to %s: wrote %zu of %d bytes.\n",
+                    chunk_index + 1,
+                    local_path,
+                    written,
+                    content_len
+                );
+            }
+
             ok = false;
             break;
         }
 
         chunk_index++;
         total_bytes += (size_t)content_len;
-        printf("\r  Downloading %s: chunk %d, %zu bytes", remote_filename, chunk_index, total_bytes);
-        fflush(stdout);
 
-        if (!run_admin_command_wait(I2C_ADMIN_PWD_CMD_FILE_DOWNLOAD_NEXT, &status) || status != ADMIN_STATUS_OK) {
+        printf(
+            "\r  Downloading %s: chunk %d, %zu bytes",
+            remote_filename,
+            chunk_index,
+            total_bytes
+        );
+        fflush(stdout);
+        progress_line_open = true;
+
+        bool next_ok = run_admin_command_wait(
+            I2C_ADMIN_PWD_CMD_FILE_DOWNLOAD_NEXT,
+            &status
+        );
+
+        if (!next_ok || status != ADMIN_STATUS_OK) {
+            if (progress_line_open) {
+                printf("\n");
+                progress_line_open = false;
+            }
+
+            if (!next_ok) {
+                if (status == ADMIN_STATUS_BUSY) {
+                    printf(
+                        "  Download failed after chunk %d "
+                        "(%zu bytes): timed out while requesting "
+                        "the next chunk.\n",
+                        chunk_index,
+                        total_bytes
+                    );
+                } else {
+                    printf(
+                        "  Download failed after chunk %d "
+                        "(%zu bytes): failed to issue or complete "
+                        "the next chunk request.\n",
+                        chunk_index,
+                        total_bytes
+                    );
+                }
+            } else {
+                printf(
+                    "  Download failed after chunk %d "
+                    "(%zu bytes): next chunk request returned %s.\n",
+                    chunk_index,
+                    total_bytes,
+                    admin_status_text(status)
+                );
+            }
+
             ok = false;
             break;
         }
     }
 
-    if (chunk_index > 0) {
+    if (progress_line_open) {
         printf("\n");
     }
 
     close_i2c_device(i2c_dev);
     fclose(fp);
+
     if (!ok) {
         remove(local_path);
     }
+
     return ok;
 }
 
