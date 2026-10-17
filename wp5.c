@@ -2034,16 +2034,28 @@ void other_settings(void) {
     float ioutAdj_float = (float)(int8_t)ioutAdj / 100.0f;
     printf("  [ 9] I-OUT adjustment [%+.3fA]\n", ioutAdj_float);
 	
-	// [10] Power source priority
+	// [10] Power source setting
     int psp = i2c_get(i2c_dev, I2C_CONF_PS_PRIORITY);
-    if (psp == 0) {
-        printf("  [10] Power source priority [V-USB first]\n");
-    } else if (psp == 1) {
-        printf("  [10] Power source priority [V-IN first]\n");
-    } else if (psp < 0) {
-        printf("  [10] Power source priority [Read error]\n");
+    if (model == MODEL_WITTYPI_5_MINI) {
+        if (psp == 0) {
+            printf("  [10] Power source [V-USB]\n");
+        } else if (psp == 1) {
+            printf("  [10] Power source [V-IN via external DC/DC]\n");
+        } else if (psp < 0) {
+            printf("  [10] Power source [Read error]\n");
+        } else {
+            printf("  [10] Power source [Invalid: %d]\n", psp);
+        }
     } else {
-        printf("  [10] Power source priority [Invalid: %d]\n", psp);
+        if (psp == 0) {
+            printf("  [10] Power source priority [V-USB first]\n");
+        } else if (psp == 1) {
+            printf("  [10] Power source priority [V-IN first]\n");
+        } else if (psp < 0) {
+            printf("  [10] Power source priority [Read error]\n");
+        } else {
+            printf("  [10] Power source priority [Invalid: %d]\n", psp);
+        }
     }
 
 	// [11] Watchdog
@@ -2059,7 +2071,9 @@ void other_settings(void) {
 	printf("  [12] Log to file on Witty Pi [%s]\n", ltf ? "Yes" : "No");
 
     // [13] VIN hot standby
-    bool vin_hot_standby_supported = firmware_supports_vin_hot_standby();
+    bool vin_hot_standby_supported =
+        firmware_supports_vin_hot_standby() &&
+        model != MODEL_WITTYPI_5_MINI;
     if (vin_hot_standby_supported) {
         int vhs = i2c_get(i2c_dev, I2C_CONF_VIN_HOT_STANDBY);
         if (vhs < 0) {
@@ -2173,14 +2187,46 @@ void other_settings(void) {
 				other_settings();
 			}
             break;
-		case 10:// Power source priority
-			if (request_input_number("Specify the power source with higher priority (0=V-USB, 1=V-IN): ", 0, 1, &input, 2)) {
-				i2c_set(-1, I2C_CONF_PS_PRIORITY, input);
-				printf("  %s is set to have higher priority!\n", input ? "V-IN" : "V-USB");
-			} else {
-				other_settings();
-			}
-			break;
+		case 10:// Power source setting
+            if (model == MODEL_WITTYPI_5_MINI) {
+                int current = i2c_get(-1, I2C_CONF_PS_PRIORITY);
+
+                if (request_input_number(
+                        "Specify the actual power source (0=V-USB, 1=V-IN via external DC/DC): ",
+                        0, 1, &input, 2)) {
+
+                    if (input != current) {
+                        printf("\n");
+                        printf("  WARNING: This setting must match the actual power wiring.\n");
+                        printf("  Changing it may immediately enable or disable the external DC/DC converter.\n");
+
+                        if (!user_confirm("Apply this power source setting?", 2)) {
+                            printf("  Task is cancelled.\n");
+                            break;
+                        }
+                    }
+
+                    if (i2c_set(-1, I2C_CONF_PS_PRIORITY, input)) {
+                        printf("  Power source is set to %s.\n",
+                               input ? "V-IN via external DC/DC" : "V-USB");
+                    } else {
+                        printf("  Failed to update power source.\n");
+                    }
+                } else {
+                    other_settings();
+                }
+            } else {
+                if (request_input_number(
+                        "Specify the power source with higher priority (0=V-USB, 1=V-IN): ",
+                        0, 1, &input, 2)) {
+                    i2c_set(-1, I2C_CONF_PS_PRIORITY, input);
+                    printf("  %s is set to have higher priority!\n",
+                           input ? "V-IN" : "V-USB");
+                } else {
+                    other_settings();
+                }
+            }
+            break;
 		case 11:// Watchdog
 			if (request_input_number("Input the number of allowed missing heartbeats for watchdog (0~255, 0=Disabled): ", 0, 255, &input, 2)) {
 				i2c_set(-1, I2C_CONF_WATCHDOG, input);
@@ -2202,6 +2248,11 @@ void other_settings(void) {
 			}
 			break;
         case 13:// VIN hot standby
+            if (model == MODEL_WITTYPI_5_MINI) {
+                printf("  VIN hot standby is not applicable to Witty Pi 5 Mini.\n");
+                sleep(2);
+                break;
+            }
             if (!vin_hot_standby_supported) {
                 printf("  VIN hot standby requires firmware v%d.%d or later.\n",
                        FW_VIN_HOT_STANDBY_REQUIRED_MAJOR,
