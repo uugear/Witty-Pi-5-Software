@@ -1338,6 +1338,16 @@ void do_info_bar(void) {
 	if (get_rtc_time(&rtc_dt)) {
 		printf("  RTC Time: %4d-%02d-%02d %02d:%02d:%02d\n", rtc_dt.year, rtc_dt.month, rtc_dt.day, rtc_dt.hour, rtc_dt.min, rtc_dt.sec);
 	}
+    if (has_fw_version && (fw_major > 1 || (fw_major == 1 && fw_minor >= 8))) {
+        Wp5DstRule dst_rule;
+        bool dst_applied;
+        if (wp5_read_dst_settings(&dst_rule, &dst_applied)) {
+            if (dst_rule.offset_minutes) {
+                printf("  DST: enabled (+%u min), %s\n", dst_rule.offset_minutes,
+                       dst_applied ? "DST active" : "standard time");
+            }
+        }
+    }
     printf("--------------------------------------------------------------------------------\n");
 }
 
@@ -1976,6 +1986,238 @@ void configure_below_temperature_action(void) {
 }
 
 
+/* Firmware v1.8 manages the DST transitions autonomously. The Linux
+ * timezone must agree with the board's rule before enabling it. */
+static bool input_dst_spec(const char *label, bool fixed, Wp5DstTimeSpec *spec) {
+    int value;
+    printf("  %s transition (local time immediately BEFORE the clock change):\n", label);
+    if (!request_input_number("    Month (1-12): ", 1, 12, &value, 2)) return false;
+    spec->month = value;
+    if (fixed) {
+        if (!request_input_number("    Date (1-31): ", 1, 31, &value, 2)) return false;
+        spec->date = value;
+    } else {
+        if (!request_input_number("    Week (0=last, 1=first, ... 5=fifth): ",
+                                  0, 5, &value, 2)) return false;
+        spec->week = value;
+        if (!request_input_number("    Weekday (0=Sunday, ... 6=Saturday): ",
+                                  0, 6, &value, 2)) return false;
+        spec->weekday = value;
+    }
+    if (!request_input_number("    Hour (0-23): ", 0, 23, &value, 2)) return false;
+    spec->hour = value;
+    if (!request_input_number("    Minute (0-59): ", 0, 59, &value, 2)) return false;
+    spec->minute = value;
+    return true;
+}
+
+static void print_dst_spec(const char *label, const Wp5DstTimeSpec *spec, bool fixed) {
+    static const char *const days[] = {"Sunday", "Monday", "Tuesday", "Wednesday",
+                                       "Thursday", "Friday", "Saturday"};
+    if (fixed) {
+        printf("    %s: %02d/%02d at %02d:%02d\n", label, spec->month,
+               spec->date, spec->hour, spec->minute);
+    } else {
+        printf("    %s: month %02d, %s %s at %02d:%02d\n", label,
+               spec->month, spec->week == 0 ? "last" :
+               spec->week == 1 ? "first" : spec->week == 2 ? "second" :
+               spec->week == 3 ? "third" : spec->week == 4 ? "fourth" : "fifth",
+               days[spec->weekday], spec->hour, spec->minute);
+    }
+}
+
+/* Report the effective Linux timezone. TZ overrides the system zone;
+ * otherwise /etc/localtime is authoritative for libc (and timedatectl).
+ * /etc/timezone can become stale, so use it only as a fallback. */
+static void show_linux_timezone(void) {
+    char name[128] = {0};
+    const char *env_tz = getenv("TZ");
+    if (env_tz && *env_tz && strlen(env_tz) < sizeof(name)) {
+        snprintf(name, sizeof(name), "%s", env_tz);
+    } else {
+        char resolved[512];
+        if (realpath("/etc/localtime", resolved)) {
+            const char *zone = strstr(resolved, "/zoneinfo/");
+            if (zone && strlen(zone + 10) < sizeof(name))
+                snprintf(name, sizeof(name), "%s", zone + 10);
+        }
+        if (!name[0]) {
+            FILE *file = fopen("/etc/timezone", "r");
+            if (file) {
+                if (fgets(name, sizeof(name), file))
+                    name[strcspn(name, "\r\n")] = '\0';
+                fclose(file);
+            }
+        }
+    }
+
+    tzset();
+    printf("  Linux timezone: %s", name[0] ? name : "unknown");
+    if (tzname[0] && tzname[0][0]) {
+        printf(" (%s", tzname[0]);
+        if (tzname[1] && tzname[1][0] && strcmp(tzname[0], tzname[1]) != 0)
+            printf("/%s", tzname[1]);
+        printf(")");
+    }
+    printf("\n");
+}
+
+/* Compare the actual Linux transition instants, not just the current UTC
+ * offset, before offering a DST preset. 0 means no preset matches. */
+static int recommended_dst_preset(time_t now) {
+    Wp5DstRule rule;
+    wp5_dst_western_europe_rule(&rule);
+    if (wp5_dst_matches_system_timezone(&rule, now)) return 2;
+    wp5_dst_central_europe_rule(&rule);
+    if (wp5_dst_matches_system_timezone(&rule, now)) return 3;
+    wp5_dst_eastern_europe_rule(&rule);
+    if (wp5_dst_matches_system_timezone(&rule, now)) return 4;
+    wp5_dst_us_rule(&rule);
+    if (wp5_dst_matches_system_timezone(&rule, now)) return 5;
+    return 0;
+}
+
+static void configure_dst(void) {
+    if (!firmware_version_at_least(1, 8)) {
+        printf("  Automatic DST requires firmware v1.8 or later.\n");
+        return;
+    }
+    Wp5DstRule current = {0};
+    bool applied = false;
+    bool current_valid = wp5_read_dst_settings(&current, &applied);
+    if (!current_valid) {
+        printf("  Cannot decode current DST configuration (or I2C read failed).\n");
+        printf("  You can replace it below, but review the result carefully.\n");
+    } else {
+        printf("\n  Current firmware DST: %s\n",
+               current.offset_minutes ? "enabled" : "disabled");
+    }
+    if (current_valid && current.offset_minutes) {
+        printf("  Offset: +%u minute(s), mode: %s, currently %s\n",
+               current.offset_minutes, current.fixed_date ? "fixed dates" : "recurring",
+               applied ? "DST" : "standard time");
+        print_dst_spec("Begin", &current.begin, current.fixed_date);
+        print_dst_spec("End", &current.end, current.fixed_date);
+    }
+    time_t now = time(NULL);
+    show_linux_timezone();
+    struct tm local;
+    if (localtime_r(&now, &local)) {
+        char ts[64];
+        strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S %Z", &local);
+        printf("  Linux local time: %s\n", ts);
+    }
+    int recommended = recommended_dst_preset(now);
+    if (recommended)
+        printf("  Recommended option: [%d]\n", recommended);
+    printf("\n");
+    printf("  [1] Disable automatic DST\n");
+    printf("  [2] WET/WEST (UTC+0/+1): Mar last Sun 01:00 -> Oct last Sun 02:00\n");
+    printf("  [3] CET/CEST (UTC+1/+2): Mar last Sun 02:00 -> Oct last Sun 03:00\n");
+    printf("  [4] EET/EEST (UTC+2/+3): Mar last Sun 03:00 -> Oct last Sun 04:00\n");
+    printf("  [5] US DST: Mar 2nd Sun 02:00 -> Nov 1st Sun 02:00\n");
+    printf("  [6] Custom recurring rule (month, week, weekday)\n");
+    printf("  [7] Custom fixed-date rule (month, date; repeats yearly)\n");
+    printf("  [8] Cancel\n");
+    int choice;
+    if (!request_input_number("Select DST configuration (1-8): ", 1, 8, &choice, 2) ||
+        choice == 8) return;
+    Wp5DstRule requested = {0};
+    switch (choice) {
+        case 1: break;
+        case 2: wp5_dst_western_europe_rule(&requested); break;
+        case 3: wp5_dst_central_europe_rule(&requested); break;
+        case 4: wp5_dst_eastern_europe_rule(&requested); break;
+        case 5: wp5_dst_us_rule(&requested); break;
+        case 6:
+        case 7: {
+            requested.fixed_date = choice == 7;
+            int value;
+            if (!request_input_number("DST shift (1-127 minutes): ",
+                                      1, 127, &value, 2)) return;
+            requested.offset_minutes = value;
+            if (!input_dst_spec("Begin", requested.fixed_date, &requested.begin) ||
+                !input_dst_spec("End", requested.fixed_date, &requested.end)) return;
+            if (!wp5_dst_rule_valid(&requested)) {
+                printf("  Invalid DST configuration; nothing changed.\n");
+                return;
+            }
+            break;
+        }
+    }
+    /* Disabling DST is independent of the Linux timezone and clock.
+     * In particular, it must not rewrite the RTC from Linux system time. */
+    if (choice == 1) {
+        if (current_valid && current.offset_minutes == 0) {
+            printf("  Automatic DST is already disabled.\n");
+            return;
+        }
+        if (!user_confirm("Disable automatic DST?", 2)) {
+            printf("  Task cancelled.\n");
+            return;
+        }
+        if (wp5_set_dst_settings(&requested)) {
+            printf("  Automatic DST disabled. RTC time was not changed.\n");
+            if (is_script_in_use()) {
+                printf("  NOTICE: An active schedule script may retain pending actions computed\n");
+                printf("  under the old DST rule. Re-activate the script to refresh them.\n");
+            }
+        } else {
+            printf("  Failed to disable automatic DST. Check the I2C log.\n");
+        }
+        return;
+    }
+    if (!wp5_dst_matches_system_timezone(&requested, time(NULL))) {
+        printf("  Selected DST rule does not match the Linux timezone.\n");
+        show_linux_timezone();
+        if (recommended)
+            printf("  Please select option [%d] instead, or check the Linux timezone.\n",
+                   recommended);
+        else
+            printf("  No predefined rule matches; check the Linux timezone or use a custom rule.\n");
+        printf("  No settings were changed.\n");
+        return;
+    }
+    printf("\n  WARNING: The Raspberry Pi Linux timezone must match this rule.\n");
+    printf("  RTC and Linux local time must already agree (within 3 seconds).\n");
+    printf("  This operation will not change the RTC time.\n");
+    if (!user_confirm("Apply this DST configuration?", 2)) {
+        printf("  Task cancelled.\n");
+        return;
+    }
+    if (wp5_set_dst_settings(&requested)) {
+        printf("  Firmware DST configuration updated successfully.\n");
+        if (is_script_in_use()) {
+            printf("  NOTICE: An active schedule script may retain pending actions computed\n");
+            printf("  under the old DST rule. Re-activate the script to refresh them.\n");
+        }
+    } else {
+        printf("  Failed to configure DST. Check the Linux timezone and I2C log.\n");
+    }
+}
+
+static void configure_voltage_confirmation(void) {
+    if (!firmware_version_at_least(1, 8)) {
+        printf("  Voltage confirmation requires firmware v1.8 or later.\n");
+        return;
+    }
+    int current = wp5_get_voltage_confirm_count();
+    if (current < 0) {
+        printf("  Failed to read voltage confirmation setting.\n");
+        return;
+    }
+    printf("  Current setting: %d additional measurement(s), %d total.\n",
+           current, current + 1);
+    printf("  Each extra reading must confirm the low/recovery threshold.\n");
+    int count;
+    if (!request_input_number("New additional confirmations (0-5): ",
+                              0, 5, &count, 2)) return;
+    if (wp5_set_voltage_confirm_count(count))
+        printf("  Voltage confirmation set to %d extra reading(s).\n", count);
+    else
+        printf("  Failed to update voltage confirmation setting.\n");
+}
+
 /**
  * Display and process menu for other settings
  */
@@ -2086,12 +2328,30 @@ void other_settings(void) {
         printf("  [13] VIN hot standby when V-USB has priority [N/A]\n");
     }
 	
-	// [14] Return to main menu
-    printf("  [14] Return to main menu\n");
+    // v1.8-only features. Do not read reserved registers from older firmware.
+    bool fw18 = firmware_version_at_least(1, 8);
+    if (fw18) {
+        Wp5DstRule rule;
+        bool applied;
+        if (wp5_read_dst_settings(&rule, &applied)) {
+            printf("  [14] Automatic DST [%s", rule.offset_minutes ? "Enabled" : "Disabled");
+            if (rule.offset_minutes) printf(", currently %s", applied ? "DST" : "standard time");
+            printf("]\n");
+        } else {
+            printf("  [14] Automatic DST [Read error]\n");
+        }
+        int count = wp5_get_voltage_confirm_count();
+        if (count >= 0) printf("  [15] Voltage confirmations [%d additional]\n", count);
+        else printf("  [15] Voltage confirmations [Read error]\n");
+    } else {
+        printf("  [14] Automatic DST [requires firmware v1.8+]\n");
+        printf("  [15] Voltage confirmations [requires firmware v1.8+]\n");
+    }
+    printf("  [16] Return to main menu\n");
     
     close_i2c_device(i2c_dev);
     
-    int optionCount = 14;
+    int optionCount = 16;
     
     printf("  Please input 1~%d: ", optionCount);
 	int value;
@@ -2271,7 +2531,13 @@ void other_settings(void) {
                 other_settings();
             }
             break;
-		case 14:// Return to main menu
+        case 14: // Automatic DST
+            configure_dst();
+            break;
+        case 15: // Voltage confirmation
+            configure_voltage_confirmation();
+            break;
+        case 16: // Return to main menu
             return;
         default:
             break;

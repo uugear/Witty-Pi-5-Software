@@ -237,8 +237,21 @@ uint8_t calculate_crc8(const uint8_t *data, size_t len) {
 }
 
 
-// Acquire I2C lock
+/* The existing register helpers acquire this lock for each I2C transfer.
+ * A DST configuration must hold it across ALL transfers, including the RTC
+ * snapshot and rollback. Recursive acquisition by the same thread allows
+ * those existing validated read/write helpers to be reused without deadlock.
+ * Other processes and threads still block in flock() until the outermost
+ * operation finishes. */
+static _Thread_local int i2c_lock_owner_fd = -1;
+static _Thread_local unsigned int i2c_lock_depth = 0;
+
+// Acquire I2C lock (recursive within the calling thread)
 int lock_file(void) {
+    if (i2c_lock_depth != 0) {
+        i2c_lock_depth++;
+        return i2c_lock_owner_fd;
+    }
     mode_t old_umask = umask(0);
     int lock_fd = open(I2C_LOCK, O_CREAT | O_RDWR, 0666);
     int open_errno = errno;
@@ -265,16 +278,21 @@ int lock_file(void) {
         );
         return -1;
     }
+    i2c_lock_owner_fd = lock_fd;
+    i2c_lock_depth = 1;
     return lock_fd;
 }
 
 
-// Release I2C lock
+// Release I2C lock; only the last nested release unlocks the file.
 void unlock_file(int lock_fd) {
-    if (lock_fd < 0) {
+    if (lock_fd < 0) return;
+    if (i2c_lock_depth == 0 || lock_fd != i2c_lock_owner_fd) {
+        print_log("Invalid I2C lock release ignored.\n");
         return;
     }
-
+    if (--i2c_lock_depth != 0) return;
+    i2c_lock_owner_fd = -1;
     flock(lock_fd, LOCK_UN);
     close(lock_fd);
 }
@@ -1026,7 +1044,10 @@ bool get_rtc_time(DateTime * dt) {
     }
 
     int i2c_dev = open_i2c_device();
-    if (i2c_dev < 0) {
+    if (i2c_dev < 0) return false;
+    int lock_fd = lock_file();
+    if (lock_fd < 0) {
+        close_i2c_device(i2c_dev);
         return false;
     }
     int sec = i2c_get(i2c_dev, I2C_VREG_RX8025_SEC);
@@ -1036,6 +1057,7 @@ bool get_rtc_time(DateTime * dt) {
     int day = i2c_get(i2c_dev, I2C_VREG_RX8025_DAY);
     int month = i2c_get(i2c_dev, I2C_VREG_RX8025_MONTH);
     int year = i2c_get(i2c_dev, I2C_VREG_RX8025_YEAR);
+    unlock_file(lock_fd);
     close_i2c_device(i2c_dev);
 
     if (sec < 0 || min < 0 || hour < 0 || wday < 0 ||
@@ -1068,56 +1090,339 @@ bool is_time_valid(DateTime * dt) {
 }
 
 
-/**
- * Write system time into RTC
- *
- * @return true if succeed, otherwise false
+/* Set an absolute instant: never parse an ambiguous local date string.
+ * wp5d runs as root, but wp5 is normally launched as a regular user. Retain
+ * the previous sudo-based privilege escalation for the interactive program. */
+static bool set_system_clock_absolute(time_t instant) {
+    struct timespec ts = {.tv_sec = instant, .tv_nsec = 0};
+    if (clock_settime(CLOCK_REALTIME, &ts) == 0) return true;
+    if (errno != EPERM) {
+        print_log("Failed setting system clock: %s\n", strerror(errno));
+        return false;
+    }
+    char command[96];
+    snprintf(command, sizeof(command), "sudo date -u -s '@%lld' >/dev/null",
+             (long long)instant);
+    if (system(command) == 0) return true;
+    print_log("Failed setting system clock with sudo.\n");
+    return false;
+}
+
+static bool write_rtc_wall_time(int i2c_dev, const struct tm *local) {
+    int year = local->tm_year + 1900;
+    if (year < 2000 || year > 2099) {
+        print_log("RTC year must be between 2000 and 2099.\n");
+        return false;
+    }
+    /* Write seconds last to reduce the window of a partially updated clock. */
+    return i2c_set(i2c_dev, I2C_VREG_RX8025_YEAR, dec_to_bcd(year - 2000)) &&
+           i2c_set(i2c_dev, I2C_VREG_RX8025_MONTH, dec_to_bcd(local->tm_mon + 1)) &&
+           i2c_set(i2c_dev, I2C_VREG_RX8025_DAY, dec_to_bcd(local->tm_mday)) &&
+           i2c_set(i2c_dev, I2C_VREG_RX8025_WEEKDAY, BIT_VALUE(local->tm_wday)) &&
+           i2c_set(i2c_dev, I2C_VREG_RX8025_HOUR, dec_to_bcd(local->tm_hour)) &&
+           i2c_set(i2c_dev, I2C_VREG_RX8025_MIN, dec_to_bcd(local->tm_min)) &&
+           i2c_set(i2c_dev, I2C_VREG_RX8025_SEC, dec_to_bcd(local->tm_sec));
+}
+
+bool wp5_firmware_supports_v18(void) {
+    int major = 0, minor = 0;
+    return get_firmware_version(&major, &minor) &&
+           (major > 1 || (major == 1 && minor >= 8));
+}
+
+static bool read_dst_regs(int dev, uint8_t registers[10]) {
+    for (int i = 0; i < 10; ++i) {
+        int value = i2c_get(dev, I2C_CONF_DST_OFFSET + i);
+        if (value < 0) return false;
+        registers[i] = (uint8_t)value;
+    }
+    return true;
+}
+
+bool wp5_read_dst_settings(Wp5DstRule *rule, bool *applied) {
+    if (!wp5_firmware_supports_v18()) return false;
+    int dev = open_i2c_device();
+    if (dev < 0) return false;
+    int lock_fd = lock_file();
+    if (lock_fd < 0) {
+        close_i2c_device(dev);
+        return false;
+    }
+    uint8_t registers[10];
+    bool ok = read_dst_regs(dev, registers);
+    unlock_file(lock_fd);
+    close_i2c_device(dev);
+    if (!ok || !wp5_dst_decode(registers, rule)) return false;
+    if (applied) *applied = registers[9] != 0;
+    return true;
+}
+
+int wp5_get_voltage_confirm_count(void) {
+    if (!wp5_firmware_supports_v18()) return -1;
+    int count = i2c_get(-1, I2C_CONF_VOLTAGE_CONFIRM_COUNT);
+    return count >= 0 && count <= 5 ? count : -1;
+}
+
+bool wp5_set_voltage_confirm_count(int count) {
+    return count >= 0 && count <= 5 && wp5_firmware_supports_v18() &&
+           i2c_set(-1, I2C_CONF_VOLTAGE_CONFIRM_COUNT, (uint8_t)count);
+}
+
+/*
+ * A changing DST_APPLIED flag must not trigger firmware's automatic RTC
+ * adjustment while the new wall clock is still being written. Suspend DST
+ * only when state changes; write time, set state, restore the rule.
  */
 bool system_to_rtc(void) {
-	DateTime sys_dt;
-	if (get_system_time(&sys_dt)) {
-        int i2c_dev = open_i2c_device();
-        if (i2c_dev < 0) {
-            return false;
-        }
-		
-        bool success = true;
-        success &= i2c_set(i2c_dev, I2C_VREG_RX8025_SEC, dec_to_bcd(sys_dt.sec));
-        success &= i2c_set(i2c_dev, I2C_VREG_RX8025_MIN, dec_to_bcd(sys_dt.min));
-        success &= i2c_set(i2c_dev, I2C_VREG_RX8025_HOUR, dec_to_bcd(sys_dt.hour));
-        success &= i2c_set(i2c_dev, I2C_VREG_RX8025_WEEKDAY, BIT_VALUE(dec_to_bcd(sys_dt.wday)));
-        success &= i2c_set(i2c_dev, I2C_VREG_RX8025_DAY, dec_to_bcd(sys_dt.day));
-        success &= i2c_set(i2c_dev, I2C_VREG_RX8025_MONTH, dec_to_bcd(sys_dt.month));
-        success &= i2c_set(i2c_dev, I2C_VREG_RX8025_YEAR, dec_to_bcd(sys_dt.year - 2000));
+    time_t now = time(NULL);
+    struct tm local;
+    if (now == (time_t)-1 || !localtime_r(&now, &local)) return false;
+    if (local.tm_year + 1900 < 2025 || local.tm_year + 1900 > 2099) {
+        print_log("System clock is not plausibly initialized. RTC not changed.\n");
+        return false;
+    }
 
-        close_i2c_device(i2c_dev);
-        return success;
-	}
-	return false;
+    int fw_major = 0, fw_minor = 0;
+    if (!get_firmware_version(&fw_major, &fw_minor)) return false;
+    bool supports_dst = fw_major > 1 || (fw_major == 1 && fw_minor >= 8);
+    int dev = open_i2c_device();
+    if (dev < 0) return false;
+    /* Keep the DST rule/flag and all RTC writes in one software transaction. */
+    int lock_fd = lock_file();
+    if (lock_fd < 0) {
+        close_i2c_device(dev);
+        return false;
+    }
+    int old_offset = -1, old_applied = -1;
+    bool enabled = false;
+    bool desired_applied = local.tm_isdst > 0;
+    bool suspended = false;
+    bool ok = false;
+
+    if (supports_dst) {
+        old_offset = i2c_get(dev, I2C_CONF_DST_OFFSET);
+        if (old_offset < 0) goto done;
+        enabled = (old_offset & 0x7f) != 0;
+        if (enabled) {
+            uint8_t registers[10];
+            Wp5DstRule rule;
+            if (!read_dst_regs(dev, registers) ||
+                !wp5_dst_decode(registers, &rule) ||
+                !wp5_dst_matches_system_timezone(&rule, now)) {
+                print_log("RTC sync refused: firmware DST rules do not match Linux timezone.\n");
+                goto done;
+            }
+            old_applied = registers[9];
+            if (local.tm_isdst < 0) goto done;
+            if ((old_applied != 0) != desired_applied) {
+                if (!i2c_set(dev, I2C_CONF_DST_OFFSET, 0)) goto done;
+                suspended = true;
+            }
+        }
+    }
+
+    /* If suspended, install the new flag before clock writes, but do not
+     * activate the DST scheduler until the wall clock agrees with it. */
+    if (suspended && !i2c_set(dev, I2C_CONF_DST_APPLIED, desired_applied)) goto done;
+    if (!write_rtc_wall_time(dev, &local)) goto done;
+    ok = true;
+
+done:
+    if (suspended) {
+        if (!ok) {
+            /* A failed partial clock write must not automatically resume DST
+             * with an inconsistent flag. Leave it disabled and report. */
+            print_log("RTC sync incomplete; firmware DST left disabled for safety.\n");
+        } else if (!i2c_set(dev, I2C_CONF_DST_OFFSET, (uint8_t)old_offset)) {
+            print_log("RTC updated but could not re-enable firmware DST.\n");
+            ok = false;
+        }
+    }
+    unlock_file(lock_fd);
+    close_i2c_device(dev);
+    return ok;
 }
 
-
-/**
- * Write RTC time into system
- *
- * @return true if succeed, otherwise false
- */
+/* Convert the local RTC wall clock into an unambiguous absolute instant.
+ * Read DST_APPLIED on both sides of the RTC snapshot; a DST transition
+ * concurrent with the read must not silently introduce a one-hour error. */
 bool rtc_to_system(void) {
-	DateTime rtc_dt;
-	if (get_rtc_time(&rtc_dt)) {
-        char date_cmd[64];
-        snprintf(date_cmd, sizeof(date_cmd),
-                "sudo date -s \"%04d-%02d-%02d %02d:%02d:%02d\"",
-                rtc_dt.year, rtc_dt.month, rtc_dt.day,
-                rtc_dt.hour, rtc_dt.min, rtc_dt.sec);
-        int result = system(date_cmd);
-        if (result == 0) {
-            return true;
+    int fw_major = 0, fw_minor = 0;
+    if (!get_firmware_version(&fw_major, &fw_minor)) return false;
+    bool supports_dst = fw_major > 1 || (fw_major == 1 && fw_minor >= 8);
+    int lock_fd = lock_file();
+    if (lock_fd < 0) return false;
+
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        int isdst = -1;
+        Wp5DstRule rule = {0};
+        bool applied = false;
+        if (supports_dst && !wp5_read_dst_settings(&rule, &applied)) goto done;
+        if (supports_dst && rule.offset_minutes != 0) isdst = applied ? 1 : 0;
+
+        DateTime rtc_dt;
+        if (!get_rtc_time(&rtc_dt) || !is_time_valid(&rtc_dt)) goto done;
+        if (isdst >= 0) {
+            int check_applied = i2c_get(-1, I2C_CONF_DST_APPLIED);
+            if (check_applied < 0) goto done;
+            if ((check_applied != 0) != applied) continue;
         }
-	}
-	return false;
+
+        struct tm tm = {.tm_year = rtc_dt.year - 1900, .tm_mon = rtc_dt.month - 1,
+                        .tm_mday = rtc_dt.day, .tm_hour = rtc_dt.hour,
+                        .tm_min = rtc_dt.min, .tm_sec = rtc_dt.sec, .tm_isdst = isdst};
+        time_t instant = mktime(&tm);
+        if (instant == (time_t)-1) goto done;
+        struct tm check;
+        if (!localtime_r(&instant, &check) ||
+            check.tm_year != rtc_dt.year - 1900 || check.tm_mon != rtc_dt.month - 1 ||
+            check.tm_mday != rtc_dt.day || check.tm_hour != rtc_dt.hour ||
+            check.tm_min != rtc_dt.min || check.tm_sec != rtc_dt.sec ||
+            (isdst >= 0 && (check.tm_isdst > 0) != (isdst > 0))) {
+            print_log("RTC sync refused: local time cannot be resolved consistently.\n");
+            goto done;
+        }
+        /* Use RTC time, not the system's potentially invalid boot time, to
+         * pick the years for validating timezone/DST transition rules. */
+        if (isdst >= 0 && !wp5_dst_matches_system_timezone(&rule, instant)) {
+            print_log("RTC sync refused: firmware DST rules do not match Linux timezone.\n");
+            goto done;
+        }
+        /* The RTC snapshot is complete; release I2C before setting Linux
+         * time, which may invoke sudo in the interactive application. */
+        unlock_file(lock_fd);
+        return set_system_clock_absolute(instant);
+    }
+    print_log("RTC changed during DST snapshot; time sync deferred.\n");
+done:
+    unlock_file(lock_fd);
+    return false;
 }
 
+static bool restore_dst_regs(int dev, const uint8_t saved[10]) {
+    bool restored = i2c_set(dev, I2C_CONF_DST_OFFSET, 0);
+    for (int i = 1; i < 10; ++i)
+        restored = i2c_set(dev, I2C_CONF_DST_OFFSET + i, saved[i]) && restored;
+    if (restored) restored = i2c_set(dev, I2C_CONF_DST_OFFSET, saved[0]);
+    if (!restored) {
+        (void)i2c_set(dev, I2C_CONF_DST_OFFSET, 0);
+        print_log("DST rollback incomplete: automatic DST left disabled.\n");
+    }
+    return restored;
+}
+
+bool wp5_set_dst_settings(const Wp5DstRule *rule) {
+    if (!wp5_dst_rule_valid(rule) || !wp5_firmware_supports_v18()) return false;
+    /* Disabling is deliberately a single configuration write. It neither
+     * checks the Linux clock nor modifies the RTC or DST_APPLIED flag. */
+    if (rule->offset_minutes == 0)
+        return i2c_set(-1, I2C_CONF_DST_OFFSET, 0);
+
+    time_t now = time(NULL);
+    struct tm local;
+    if (now == (time_t)-1 || !localtime_r(&now, &local) ||
+        local.tm_year + 1900 < 2025 || local.tm_year + 1900 > 2099)
+        return false;
+    if (!wp5_dst_matches_system_timezone(rule, now)) {
+        print_log("DST configuration refused: rule differs from Linux local timezone.\n");
+        return false;
+    }
+
+    uint8_t new_regs[9], previous[10];
+    if (!wp5_dst_encode(rule, new_regs)) return false;
+    int dev = open_i2c_device();
+    if (dev < 0) return false;
+    int lock_fd = lock_file();
+    if (lock_fd < 0) {
+        close_i2c_device(dev);
+        return false;
+    }
+
+    bool ok = false;
+    bool modified = false;
+    if (!read_dst_regs(dev, previous)) goto done;
+
+    /* Check both clocks while the whole software-side transaction is locked.
+     * Read the firmware's applied-state flag on both sides of the RTC clock
+     * snapshot: firmware DST may still change it autonomously. */
+    time_t before = time(NULL);
+    DateTime rtc_dt;
+    if (before == (time_t)-1 || !get_rtc_time(&rtc_dt) ||
+        !is_time_valid(&rtc_dt)) {
+        print_log("DST configuration refused: unable to read a valid RTC time.\n");
+        goto done;
+    }
+    time_t after = time(NULL);
+    int applied_after = i2c_get(dev, I2C_CONF_DST_APPLIED);
+    if (applied_after < 0 || applied_after != previous[9]) {
+        print_log("DST configuration refused: firmware DST state changed during RTC read.\n");
+        goto done;
+    }
+
+    struct tm rtc_wall = {
+        .tm_year = rtc_dt.year - 1900, .tm_mon = rtc_dt.month - 1,
+        .tm_mday = rtc_dt.day, .tm_hour = rtc_dt.hour,
+        .tm_min = rtc_dt.min, .tm_sec = rtc_dt.sec,
+    };
+    bool currently_dst = false;
+    if (!wp5_dst_rtc_matches_system(&rtc_wall, before, after, 3,
+                                    &currently_dst)) {
+        struct tm linux_wall;
+        char rtc_text[32], linux_text[32];
+        strftime(rtc_text, sizeof(rtc_text), "%Y-%m-%d %H:%M:%S", &rtc_wall);
+        if (after != (time_t)-1 && localtime_r(&after, &linux_wall))
+            strftime(linux_text, sizeof(linux_text), "%Y-%m-%d %H:%M:%S", &linux_wall);
+        else
+            snprintf(linux_text, sizeof(linux_text), "unavailable");
+        print_log("DST configuration refused: RTC time (%s) and Linux "
+                  "local time (%s) do not agree, or a time transition occurred.\n",
+                  rtc_text, linux_text);
+        print_log("Synchronize the clocks separately before enabling DST. "
+                  "RTC was not changed.\n");
+        goto done;
+    }
+
+    /* Firmware runs independently of the host I2C lock. A transition or
+     * system-clock change after validation would make R53 ambiguous. */
+    time_t check_now = time(NULL);
+    struct tm check_local;
+    if (check_now == (time_t)-1 || check_now < after || check_now - after > 10 ||
+        !localtime_r(&check_now, &check_local) ||
+        (check_local.tm_isdst > 0) != currently_dst) {
+        print_log("DST configuration refused: system time changed during validation.\n");
+        goto done;
+    }
+
+    /* First disable firmware automatic DST, then install the new rule and
+     * DST_APPLIED state. The existing RTC time is never modified. */
+    modified = true;
+    if (!i2c_set(dev, I2C_CONF_DST_OFFSET, 0)) goto failed;
+    for (int i = 1; i < 9; ++i)
+        if (!i2c_set(dev, I2C_CONF_DST_OFFSET + i, new_regs[i])) goto failed;
+    if (!i2c_set(dev, I2C_CONF_DST_APPLIED, currently_dst ? 1 : 0)) goto failed;
+
+    /* Do not enable the rule if a DST boundary was crossed while writing.
+     * The rollback below restores the old rule without rewriting the clock. */
+    check_now = time(NULL);
+    if (check_now == (time_t)-1 || !localtime_r(&check_now, &check_local) ||
+        (check_local.tm_isdst > 0) != currently_dst) {
+        print_log("DST boundary crossed during configuration; restoring old rule.\n");
+        goto failed;
+    }
+    if (!i2c_set(dev, I2C_CONF_DST_OFFSET, new_regs[0])) goto failed;
+    ok = true;
+    goto done;
+
+failed:
+    if (modified) {
+        print_log("DST configuration failed; attempting to restore previous rule.\n");
+        (void)restore_dst_regs(dev, previous);
+    }
+done:
+    unlock_file(lock_fd);
+    close_i2c_device(dev);
+    return ok;
+}
 
 /**
  * Write network time into system and RTC
@@ -1190,44 +1495,12 @@ bool network_to_system_and_rtc(void) {
         return false;
     }
     
-    time_t utc_time;
-    time_info.tm_isdst = 0;
-    
-    char *old_tz = getenv("TZ");
-    char old_tz_buf[256] = {0};
-    if (old_tz) {
-        strncpy(old_tz_buf, old_tz, sizeof(old_tz_buf) - 1);
-    }
-    
-    setenv("TZ", "UTC", 1);
-    tzset();
-    
-    utc_time = mktime(&time_info);
-    
-    if (old_tz) {
-        setenv("TZ", old_tz_buf, 1);
-    } else {
-        unsetenv("TZ");
-    }
-    tzset();
-    
-    if (utc_time == (time_t)-1) {
+    /* The HTTP Date header is GMT. Convert directly to a Unix timestamp;
+     * a detour through a local date string would be ambiguous during DST. */
+    time_t utc_time = timegm(&time_info);
+    if (utc_time == (time_t)-1 || !set_system_clock_absolute(utc_time))
         return false;
-    }
-    
-    // Convert UTC time to local time
-    struct tm *local_tm = localtime(&utc_time);
-    
-    char date_cmd[64];
-    snprintf(date_cmd, sizeof(date_cmd),
-            "sudo date -s \"%04d-%02d-%02d %02d:%02d:%02d\"",
-            local_tm->tm_year + 1900, local_tm->tm_mon + 1, local_tm->tm_mday,
-            local_tm->tm_hour, local_tm->tm_min, local_tm->tm_sec);
-    int result = system(date_cmd);
-    if (result != 0) {
-        return false;
-    }
-    
+
     return system_to_rtc();
 }
 

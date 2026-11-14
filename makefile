@@ -11,7 +11,7 @@ VERSION_PATCH := $(shell awk '/^[[:space:]]*#define[[:space:]]+SOFTWARE_VERSION_
 SOFTWARE_VERSION := $(VERSION_MAJOR).$(VERSION_MINOR).$(VERSION_PATCH)
 DEB_FILE := wp5_$(SOFTWARE_VERSION)-1_arm64.deb
 
-.PHONY: all clean debpkg
+.PHONY: all clean debpkg test
 
 all: wp5d wp5 debpkg
 
@@ -34,13 +34,16 @@ debpkg: wp5lib wp5d wp5
 	$(DPKG) --build debpkg "$(DEB_FILE)"
 
 wp5: wp5lib
-	$(CC) -o wp5 wp5.c wp5lib.o
+	$(CC) -o wp5 wp5.c wp5lib.o wp5dst.o
 
 wp5d: wp5lib
-	$(CC) -o wp5d wp5d.c wp5lib.o
+	$(CC) -o wp5d wp5d.c wp5lib.o wp5dst.o
 
-wp5lib: wp5lib.c
+wp5lib: wp5lib.c wp5lib.h wp5dst.o
 	$(CC) -c wp5lib.c
+
+wp5dst.o: wp5dst.c wp5dst.h
+	$(CC) -c wp5dst.c
 
 clean:
 	rm -f *.deb
@@ -51,4 +54,10 @@ clean:
 	rm -f debpkg/lib/systemd/system/wp5d_reboot.service
 	rm -f wp5
 	rm -f wp5d
-	rm -f wp5lib.o
+	rm -f wp5lib.o wp5dst.o
+
+# Host-side tests; do not require Raspberry Pi hardware or an I2C adapter.
+test:
+	$(CC) -std=gnu11 -Wall -Wextra -Werror -I. -o tests/test_dst tests/test_dst.c wp5dst.c
+	./tests/test_dst
+	rm -f tests/test_dst

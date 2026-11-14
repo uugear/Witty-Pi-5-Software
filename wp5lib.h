@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include "wp5dst.h"
 
 #define STRINGIFY(x) #x
 #define TO_STRING(x) STRINGIFY(x)
@@ -10,8 +11,8 @@
 #define BIT_VALUE(bit) (1 << (bit))
 
 #define SOFTWARE_VERSION_MAJOR	5
-#define SOFTWARE_VERSION_MINOR	3
-#define SOFTWARE_VERSION_PATCH  1
+#define SOFTWARE_VERSION_MINOR	4
+#define SOFTWARE_VERSION_PATCH  0
 
 #define SOFTWARE_VERSION_STR    TO_STRING(SOFTWARE_VERSION_MAJOR) "." TO_STRING(SOFTWARE_VERSION_MINOR) "." TO_STRING(SOFTWARE_VERSION_PATCH)
 
@@ -104,6 +105,7 @@
 #define I2C_CONF_SYS_CLOCK_MHZ		54	// [0x36] System clock (in MHz) for RP2350: default=48 (required for USB drive and USB-uart)
 
 #define I2C_CONF_VIN_HOT_STANDBY    55  // [0x37] HAT+ only: keep VIN DC/DC enabled in VUSB-first mode; ignored by Mini
+#define I2C_CONF_VOLTAGE_CONFIRM_COUNT 56  // [0x38] Additional confirmation reads, 0..5 (v1.8+)
 
 #define I2C_CONF_LAST               63  // ------
 #define I2C_ADMIN_FIRST             64  // ------
@@ -654,6 +656,24 @@ bool run_admin_command_wait(uint16_t psw_cmd, uint8_t *status);
  */
 bool get_firmware_version(int *major, int *minor);
 
+
+
+/** The automatic DST and voltage-confirmation features require firmware v1.8+. */
+bool wp5_firmware_supports_v18(void);
+
+/** Read the complete firmware DST rule and its current applied-state flag. */
+bool wp5_read_dst_settings(Wp5DstRule *rule, bool *applied);
+
+/**
+ * Configure the firmware DST rule without changing RTC time. Before enabling,
+ * require the RTC wall clock to match the Linux local clock and timezone.
+ * A rule with offset_minutes=0 disables DST without a time check.
+ */
+bool wp5_set_dst_settings(const Wp5DstRule *rule);
+
+/** Read or set R56. The count is ADDITIONAL samples, not total samples. */
+int wp5_get_voltage_confirm_count(void);
+bool wp5_set_voltage_confirm_count(int count);
 
 /**
  * Check if schedule script is in use
